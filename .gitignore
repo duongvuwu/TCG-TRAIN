@@ -1,0 +1,46 @@
+# Data and replays
+data/
+replays/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.jsonl
+*.parquet
+*.npz
+cabt_api_docs.txt
+result.html
+
+# Simulator native binaries
+cg/*.dll
+cg/*.so
+cg/*.dylib
+
+# Checkpoints and models
+checkpoints/
+models/
+artifacts/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+
+# Python & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+wheels/
+
+# Secrets & credentials
+.env
+kaggle.json
+.kaggle/
