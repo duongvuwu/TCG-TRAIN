@@ -15,10 +15,16 @@ STATE_DIM = 64
 OPT_DIM = 48
 MAX_HAND_CARDS = 16
 NUM_BOARD_SLOTS = 12  # [my_active, my_bench_0..4, opp_active, opp_bench_0..4]
-MAX_CARD_ID = 1300
-MAX_ATTACK_ID = 1600
+MAX_CARD_ID = 2048
+MAX_ATTACK_ID = 2048
 MAX_SELECT_CTX = 64
 MAX_SELECT_TYPE = 16
+
+
+def int_or(d: dict[str, Any], key: str, default: int) -> int:
+    """Safely read an integer field from `d` without falsy-zero bugs (`0` is preserved)."""
+    val = d.get(key)
+    return default if val is None else int(val)
 
 
 @lru_cache(maxsize=1)
@@ -80,13 +86,13 @@ def _pokemon_summary(p: dict[str, Any] | None, card_db: dict[int, Any]) -> tuple
     if not p or not isinstance(p, dict):
         return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
     cid = _clamp_card_id(p.get("id"))
-    hp = float(p.get("hp") or 0)
-    max_hp = float(p.get("maxHp") or max(hp, 1.0))
+    hp = float(int_or(p, "hp", 0))
+    max_hp = float(int_or(p, "maxHp", int(max(hp, 1.0))))
     dmg_ratio = max(0.0, (max_hp - hp) / max(max_hp, 1.0))
     energies = p.get("energies") or []
     tools = p.get("tools") or []
     cmeta = card_db.get(cid)
-    is_ex = 1.0 if (cmeta and getattr(cmeta, "ex", False)) else 0.0
+    is_ex = 1.0 if (cmeta and getattr(cmeta, "ex", False)) or max_hp >= 210.0 else 0.0
     return (
         1.0,
         min(hp / 340.0, 1.5),
@@ -160,45 +166,46 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
     cur = obs["current"]
     sel = obs["select"]
     opts = sel.get("option") or []
-    me = int(cur["yourIndex"])
+    me = int_or(cur, "yourIndex", 0)
     opp = 1 - me
     p_me = cur["players"][me]
     p_opp = cur["players"][opp]
 
     state_vec = np.zeros(STATE_DIM, dtype=np.float32)
-    turn = float(cur.get("turn") or 0)
+    turn = float(int_or(cur, "turn", 0))
     state_vec[0] = min(turn / 25.0, 2.0)
     state_vec[1] = 1.0 if turn == 0 else 0.0
-    state_vec[2] = min(float(cur.get("turnActionCount") or 0) / 15.0, 2.0)
-    state_vec[3] = 1.0 if cur.get("firstPlayer") == me else 0.0
-    state_vec[4] = 1.0 if cur.get("firstPlayer") == opp else 0.0
+    state_vec[2] = min(float(int_or(cur, "turnActionCount", 0)) / 15.0, 2.0)
+    first_player = int_or(cur, "firstPlayer", -1)
+    state_vec[3] = 1.0 if first_player == me else 0.0
+    state_vec[4] = 1.0 if first_player == opp else 0.0
     state_vec[5] = 1.0 if cur.get("supporterPlayed") else 0.0
     state_vec[6] = 1.0 if cur.get("stadiumPlayed") else 0.0
     state_vec[7] = 1.0 if cur.get("energyAttached") else 0.0
     state_vec[8] = 1.0 if cur.get("retreated") else 0.0
-    state_vec[9] = float(cur.get("round") or 1) / 3.0
+    state_vec[9] = float(int_or(cur, "round", 1)) / 3.0
 
-    stype = int(sel.get("type") or 0)
-    sctx = int(sel.get("context") or 0)
-    min_c = int(sel.get("minCount") or 0)
-    max_c = int(sel.get("maxCount") or 1)
+    stype = int_or(sel, "type", 0)
+    sctx = int_or(sel, "context", 0)
+    min_c = int_or(sel, "minCount", 0)
+    max_c = int_or(sel, "maxCount", 1)
     if 0 <= stype < 11:
         state_vec[10 + stype] = 1.0
     state_vec[21] = min(min_c / 5.0, 1.5)
     state_vec[22] = min(max_c / 5.0, 1.5)
     state_vec[23] = 1.0 if max_c > 1 else 0.0
     state_vec[24] = 1.0 if min_c == 0 else 0.0
-    state_vec[25] = min(float(sel.get("remainDamageCounter") or 0) / 10.0, 2.0)
-    state_vec[26] = min(float(sel.get("remainEnergyCost") or 0) / 5.0, 2.0)
+    state_vec[25] = min(float(int_or(sel, "remainDamageCounter", 0)) / 10.0, 2.0)
+    state_vec[26] = min(float(int_or(sel, "remainEnergyCost", 0)) / 5.0, 2.0)
     state_vec[27] = min(len(opts) / 20.0, 2.0)
 
     # Player counts
     my_prizes = len(p_me.get("prize") or [])
     opp_prizes = len(p_opp.get("prize") or [])
-    my_hand_cnt = int(p_me.get("handCount") or 0)
-    opp_hand_cnt = int(p_opp.get("handCount") or 0)
-    my_deck_cnt = int(p_me.get("deckCount") or 0)
-    opp_deck_cnt = int(p_opp.get("deckCount") or 0)
+    my_hand_cnt = int_or(p_me, "handCount", 0)
+    opp_hand_cnt = int_or(p_opp, "handCount", 0)
+    my_deck_cnt = int_or(p_me, "deckCount", 0)
+    opp_deck_cnt = int_or(p_opp, "deckCount", 0)
     my_disc_cnt = len(p_me.get("discard") or [])
     opp_disc_cnt = len(p_opp.get("discard") or [])
     my_bench = p_me.get("bench") or []
@@ -234,10 +241,10 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
     state_vec[55] = min(sum(len(bp.get("energies") or []) for bp in my_bench if isinstance(bp, dict)) / 10.0, 2.0)
     state_vec[56] = min(sum(len(bp.get("energies") or []) for bp in opp_bench if isinstance(bp, dict)) / 10.0, 2.0)
 
-    # Hand composition summary (only self hand is visible)
+    # Hand composition summary (only self hand is visible; includes CardType.STADIUM == 4)
     my_hand = p_me.get("hand") or []
     hand_cards = np.zeros(MAX_HAND_CARDS, dtype=np.int64)
-    n_poke = n_item = n_supp = n_energy = n_basic_poke = 0
+    n_poke = n_item_or_stad = n_supp = n_energy = n_basic_poke = 0
     for idx_h, hcard in enumerate(my_hand):
         if not isinstance(hcard, dict):
             continue
@@ -251,20 +258,20 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
                 n_poke += 1
                 if getattr(cmeta, "basic", False):
                     n_basic_poke += 1
-            elif ct in (1, 2):
-                n_item += 1
-            elif ct == 3:
+            elif ct in (1, 2, 4):  # ITEM (1), TOOL (2), STADIUM (4)
+                n_item_or_stad += 1
+            elif ct == 3:  # SUPPORTER (3)
                 n_supp += 1
-            elif ct in (5, 6):
+            elif ct in (5, 6):  # BASIC_ENERGY (5), SPECIAL_ENERGY (6)
                 n_energy += 1
 
     state_vec[57] = min(n_poke / 6.0, 1.5)
     state_vec[58] = min(n_basic_poke / 4.0, 1.5)
-    state_vec[59] = min(n_item / 6.0, 1.5)
+    state_vec[59] = min(n_item_or_stad / 6.0, 1.5)
     state_vec[60] = min(n_supp / 4.0, 1.5)
     state_vec[61] = min(n_energy / 6.0, 1.5)
     state_vec[62] = 1.0 if (cur.get("stadium") and len(cur["stadium"]) > 0) else 0.0
-    state_vec[63] = float(p_me.get("win") or 0) - float(p_opp.get("win") or 0)
+    state_vec[63] = float(int_or(p_me, "win", 0)) - float(int_or(p_opp, "win", 0))
 
     # Board slot card IDs: [my_active, my_bench_0..4, opp_active, opp_bench_0..4]
     board_cards = np.zeros(NUM_BOARD_SLOTS, dtype=np.int64)
@@ -284,7 +291,7 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
     opt_target_card_ids = np.zeros(max(n_opts, 1), dtype=np.int64)
     opt_attack_ids = np.zeros(max(n_opts, 1), dtype=np.int64)
 
-    opp_act_hp = float(opp_act.get("hp") or 0) if isinstance(opp_act, dict) else 0.0
+    opp_act_hp = float(int_or(opp_act, "hp", 0)) if isinstance(opp_act, dict) else 0.0
     opp_act_weak = None
     if oa_cid in card_db:
         opp_act_weak = getattr(card_db[oa_cid], "weakness", None)
@@ -294,7 +301,7 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
 
     for i, o in enumerate(opts):
         v = opt_feats[i]
-        otype = int(o.get("type") or 0)
+        otype = int_or(o, "type", 0)
         if 0 <= otype < 17:
             v[otype] = 1.0
 
@@ -306,10 +313,13 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
         if p_idx is None:
             p_idx = me
 
-        # Area encoding (17..23)
-        if area in (1, 2, 3, 4, 5, 6, 12):
-            area_slot = {1: 17, 2: 18, 3: 19, 4: 20, 5: 21, 6: 22, 12: 23}[area]
+        # Area encoding (17..23): includes STADIUM (7) mapped with LOOKING (12) in slot 23
+        if area in (1, 2, 3, 4, 5, 6):
+            area_slot = {1: 17, 2: 18, 3: 19, 4: 20, 5: 21, 6: 22}[area]
             v[area_slot] = 1.0
+        elif area in (7, 12):  # STADIUM (7) or LOOKING (12)
+            v[23] = 1.0
+
         if in_play_area == 4:
             v[24] = 1.0
         elif in_play_area == 5:
@@ -317,8 +327,8 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
 
         v[26] = 1.0 if p_idx == me else 0.0
         v[27] = 1.0 if p_idx == opp else 0.0
-        v[28] = min(float(o.get("number") or 0) / 10.0, 2.0)
-        v[29] = min(float(o.get("count") or 0) / 5.0, 2.0)
+        v[28] = min(float(int_or(o, "number", 0)) / 10.0, 2.0)
+        v[29] = min(float(int_or(o, "count", 0)) / 5.0, 2.0)
         v[30] = float(i) / max(n_opts - 1, 1)
 
         src_cid = 0
@@ -373,6 +383,13 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
             v[38] = min(float(getattr(cmeta, "hp", 0) or 0) / 340.0, 1.5)
             v[39] = 1.0 if getattr(cmeta, "ex", False) else 0.0
             v[40] = 1.0 if (getattr(cmeta, "skills", None) and len(cmeta.skills) > 0) else 0.0
+        elif isinstance(src_poke, dict):
+            # Fallback metadata when cardId > 1267 is in play on the board
+            v[31] = 1.0  # POKEMON
+            hp_p = float(int_or(src_poke, "maxHp", 0))
+            v[38] = min(hp_p / 340.0, 1.5)
+            v[39] = 1.0 if hp_p >= 210.0 else 0.0
+            v[40] = 1.0 if otype == 10 else 0.0
 
         # Target Pokémon state features (41..44)
         if isinstance(tgt_poke, dict):
@@ -393,6 +410,10 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
             v[45] = min(eff_dmg / 300.0, 2.0)
             v[46] = min(len(getattr(ameta, "energies", []) or []) / 5.0, 1.5)
             v[47] = 1.0 if (opp_act_hp > 0 and eff_dmg >= opp_act_hp) else 0.0
+        elif otype == 13 and aid > 0:
+            # Fallback for newer attackId > 1556
+            v[45] = 0.5
+            v[46] = 0.4
 
     return {
         "state_vec": state_vec,

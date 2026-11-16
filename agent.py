@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from src.features import int_or
 from src.model import PTCGPolicyNet
 from src.train import load_default_deck, load_policy_from_checkpoint
 
@@ -50,7 +51,7 @@ def agent(obs_dict: dict[str, Any]) -> list[int]:
     if not isinstance(obs_dict, dict):
         return list(_DEFAULT_DECK)
 
-    # Unwrap if kaggle_environments wraps inside `obs_dict["obs"]`
+    # Unwrap if kaggle_environments wraps inside `obs_dict["observation"]`
     inner = obs_dict
     if "select" not in inner and isinstance(inner.get("observation"), dict):
         inner = inner["observation"]
@@ -62,10 +63,13 @@ def agent(obs_dict: dict[str, Any]) -> list[int]:
 
     opts = sel.get("option") or []
     n_opts = len(opts)
-    min_c = max(0, min(int(sel.get("minCount") or 0), n_opts))
-    max_c = max(min_c, min(int(sel.get("maxCount") or 1), n_opts))
-    if n_opts == 0 or max_c == 0:
+    raw_min = int_or(sel, "minCount", 0)
+    raw_max = int_or(sel, "maxCount", 1)
+    if n_opts == 0 or raw_max <= 0:
         return []
+
+    min_c = max(0, min(raw_min, n_opts))
+    max_c = max(min_c, min(raw_max, n_opts))
 
     try:
         act = _MODEL.select_action(inner, default_deck=_DEFAULT_DECK, device="cpu")

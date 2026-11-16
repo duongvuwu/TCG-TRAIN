@@ -3,6 +3,7 @@
 ## 1. Tổng Quan & Đối Chiếu Dữ Liệu / Simulator
 
 - **Dataset Kaggle**: [`kaggle/the-pokemon-company-ptcg-ai-battle-challenge-playground-episodes-2026-11-13`](https://www.kaggle.com/datasets/kaggle/the-pokemon-company-ptcg-ai-battle-challenge-playground-episodes-2026-11-13) — **Version 1** (`2026-11-13-v1`), gồm `manifest.csv` (1.644 episodes) và các file JSON replay định dạng `kaggle-environments`.
+- **Cấu hình Phiên bản & Tái lập**: `dataset_version = 2026-11-13-v1`, `seed = 42`, nhánh Git `ao/quy-t-c/root` (commit nền `f96eb6201876b27c7f9e80a5ed52781bb913d820`, cập nhật bản vá toàn diện `BUG-1..BUG-7`; mã `git_commit` của `HEAD` hiện tại được lưu tự động trong `checkpoints/eval_results.json`).
 - **Simulator Engine**: **CABT Engine** (`cg` package: `cg/api.py`, `cg/game.py`, `cg/sim.py`, `cg/utils.py`, cùng thư viện biên dịch `cg/cg.dll` cho Windows và `cg/libcg.so` cho Linux/Colab).
 - **Xác minh cơ chế ghép `observation` – `action` trên replay thật**:
   - Mỗi episode là một trận đấu BO3 (`configuration.bo = 3`, `version = 2`), gồm danh sách `steps[0 .. T-1]`, mỗi bước có 2 phần tử cho `seat 0` và `seat 1`.
@@ -37,66 +38,77 @@
 | — Trong đó: Quyết định setup (`turn == 0`) | **380** | `IS_FIRST`, `MULLIGAN`, `SETUP_ACTIVE_POKEMON`, `SETUP_BENCH_POKEMON` |
 | — Trong đó: Quyết định trong trận (`turn >= 1`) | **16.472** | Main phase, chọn bài, đính năng lượng, tiến hóa, dùng chiêu, rút lui |
 | — Trong đó: Quyết định chọn 1 mục (`maxCount == 1`) | **15.900** | Single-select (`minCount <= 1, maxCount == 1`) |
-| — Trong đó: Quyết định chọn nhiều mục (`maxCount > 1`) | **952** | Multi-select (`maxCount in {2, 3, 4}`, gồm cả `minCount == 0` và `minCount == maxCount`) |
+| — Trong đó: Quyết định chọn nhiều mục (`maxCount > 1`) | **952** | Multi-select (`2 <= maxCount <= 6`, gồm cả `minCount == 0`, `minCount < maxCount` và `minCount == maxCount`) |
 
 ---
 
 ## 3. Kiến Trúc Policy Imitation Learning & Trạng Thái Colab Pro / GPU
 
 ### 3.1. Kiến trúc `PTCGPolicyNet` (`src/model.py`)
-- **Biểu diễn trạng thái (`State Encoder`)**: Kết hợp vector đặc trưng dày 64 chiều (`turn`, `turnActionCount`, `firstPlayer`, flags `supporterPlayed`/`stadiumPlayed`/`energyAttached`/`retreated`, one-hot `SelectType`, `minCount`, `maxCount`, `remainDamageCounter`, `remainEnergyCost`, số Prize/Hand/Deck/Discard/Bench hai bên, thông số Active Pokémon hai bên, cơ cấu bài trên tay của bản thân) cùng **Entity Embeddings** (`card_emb` 24 chiều cho 1.267 lá bài, `ctx_emb` 12 chiều cho 49 ngữ cảnh `SelectContext`, `type_emb` 8 chiều cho `SelectType`).
-- **Biểu diễn lựa chọn (`Option Encoder` & `Candidate Scorer`)**: Mỗi lựa chọn hợp lệ `i in 0..K-1` trong `obs["select"]["option"]` được trích xuất vector đặc trưng 48 chiều (one-hot `OptionType`, `AreaType`, `inPlayArea`, thông số `CardData` của lá bài nguồn, trạng thái Pokémon đích, sát thương hiệu dụng có tính Weakness `2x` và cờ **Lethal KO** nếu sát thương `>= HP` của Active Pokémon đối thủ) kết hợp embedding của `src_card_id`, `target_card_id`, và `attack_id`.
-- **Giới hạn hợp lệ & Multi-Select (`Stop-Threshold Head`)**:
-  - Mạng chỉ chấm điểm trên đúng danh sách `K` lựa chọn hợp lệ hiện tại (`0 .. K-1`).
-  - Nhánh `stop_head` dự đoán ngưỡng dừng `z_stop` cho các quyết định có số lượng chọn linh hoạt (`minCount < maxCount`): các lựa chọn được xếp hạng giảm dần theo `z_i`, lấy tối thiểu `minCount` mục và tiếp tục chọn tối đa `min(maxCount, K)` mục nếu `z_i > z_stop` (trả về danh sách chỉ số tăng dần duy nhất `list[int]`).
-  - Bảo vệ chống lặp nội bộ trong lượt (`turnActionCount >= 20` tại menu `MAIN` sẽ ưu tiên hành động kết thúc lượt `ATTACK` hoặc `END`).
+- **Biểu diễn trạng thái (`State Encoder`)**: Kết hợp vector đặc trưng dày 64 chiều (`turn`, `turnActionCount`, `firstPlayer`, flags `supporterPlayed`/`stadiumPlayed`/`energyAttached`/`retreated`, one-hot `SelectType`, `minCount`, `maxCount`, `remainDamageCounter`, `remainEnergyCost`, số Prize/Hand/Deck/Discard/Bench hai bên, thông số Active Pokémon hai bên, cơ cấu bài trên tay của bản thân bao gồm cả `CardType.STADIUM = 4`) cùng **Entity Embeddings** (`card_emb` 24 chiều với `MAX_CARD_ID = 2048` bao phủ toàn bộ ID thẻ bài mới tới `1413`, `atk_emb` 16 chiều với `MAX_ATTACK_ID = 2048` bao phủ toàn bộ ID chiêu thức mới tới `1748`, `ctx_emb` 12 chiều cho `MAX_SELECT_CTX = 64`, `type_emb` 8 chiều cho `MAX_SELECT_TYPE = 16`).
+- **Biểu diễn lựa chọn (`Option Encoder` & `Candidate Scorer`)**: Mỗi lựa chọn hợp lệ `i in 0..K-1` trong `obs["select"]["option"]` được trích xuất vector đặc trưng 48 chiều (one-hot `OptionType`, `AreaType` bao gồm cả `AreaType.STADIUM = 7`, `inPlayArea`, thông số `CardData` của lá bài nguồn, trạng thái Pokémon đích, sát thương hiệu dụng có tính Weakness `2x` và cờ **Lethal KO** nếu sát thương `>= HP` của Active Pokémon đối thủ) kết hợp embedding của `src_card_id`, `target_card_id`, và `attack_id`.
+- **Giới hạn hợp lệ, Multi-Select (`Stop-Threshold Head`) & Tactical Guardrails**:
+  - Mạng chỉ chấm điểm trên đúng danh sách `K` lựa chọn hợp lệ hiện tại (`0 .. K-1`), xử lý an toàn trường hợp `maxCount == 0` (trả về `[]`) thông qua helper `int_or` tránh lỗi falsy-zero.
+  - Nhánh `stop_head` dự đoán ngưỡng dừng `z_stop` cho các quyết định có số lượng chọn linh hoạt (`minCount < maxCount`), đồng thời hàm `compute_policy_loss` bổ sung cột virtual stop (`max_opts`) vào Cross-Entropy khi `minCount == 0` để học trực tiếp hành động rỗng `[]`.
+  - `_apply_tactical_guardrails` kết hợp hồ sơ năng lượng/chiêu thức khả thi từ `cg.api` (`_get_deck_pokemon_profiles`) để tổng quát hóa sang các bộ bài chứa lá bài chưa gặp trong tập train (`dragapult_deck`, `starmie_deck`) và chặn vòng lặp tuyệt đối khi `turnActionCount >= 20` tại menu `MAIN` (chỉ cho phép `ATTACK = 13` hoặc `END = 14`).
 
 ### 3.2. Kiểm tra Colab MCP & Huấn luyện GPU thực tế
 - **Trạng thái Colab MCP**: Trong phiên làm việc hiện tại, các công cụ Colab MCP (`get_subscription`, `list_runtimes`, `list_runtime_specs`, `execute_code`) **không được gắn vào danh sách tool của phiên** (bị chặn/chưa kết nối ở tầng MCP).
 - **Giải pháp đã thực hiện**:
-  1. Đã cài đặt **PyTorch 2.6.0+cu124** và chạy huấn luyện trực tiếp trên **GPU NVIDIA GeForce RTX 4050 Laptop GPU** có sẵn trên máy (đo tốc độ thực tế và VRAM đỉnh, kèm kiểm증 resume từ checkpoint từ epoch 20 lên epoch 22).
+  1. Đã cài đặt **PyTorch 2.6.0+cu124** và chạy huấn luyện trực tiếp trên **GPU NVIDIA GeForce RTX 4050 Laptop GPU** có sẵn trên máy (đo tốc độ thực tế và VRAM đỉnh, kèm kiểm chứng resume từ checkpoint từ epoch 20 lên epoch 22 với `CosineAnnealingLR` giữ LR ổn định tại `0.000100`).
   2. Đã tạo sẵn notebook Colab Pro mỏng tại [`notebooks/colab_train_eval.ipynb`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/notebooks/colab_train_eval.ipynb) gọi cùng bộ lệnh CLI (`nvidia-smi`, mount Google Drive lưu checkpoint bền vững, tải dữ liệu, tiền xử lý trên CPU, train/resume trên GPU T4 và đánh giá). Khi mở trên Colab Pro, người dùng chỉ cần chọn **Runtime -> Change runtime type -> T4 GPU** và bấm **Run all**.
 
 ### 3.3. Thông số Huấn luyện & Thiết bị
 - **Thiết bị GPU**: `NVIDIA GeForce RTX 4050 Laptop GPU` (Driver `591.86`, CUDA `13.1`, PyTorch `2.6.0+cu124`)
 - **Cấu hình**: `epochs = 20` (+ `2` epochs resume = `22`), `batch_size = 128`, `lr = 2e-3`, `weight_decay = 1e-4`, `hidden_dim = 128`, `dropout = 0.1`, `seed = 42`
-- **Tốc độ huấn luyện**: `~10.200 – 11.166 samples/sec` (`~1,1s / epoch`)
-- **VRAM đỉnh (Peak VRAM)**: **`31,22 MB`**
+- **Tốc độ huấn luyện**: `~4.992 – 6.286 samples/sec` (`~1,81 – 2,28s / epoch`; đợt resume 2 epochs hoàn tất trong `4,607s`)
+- **VRAM đỉnh (Peak VRAM)**: **`31,74 MB`** (`31,62 MB` tại Epoch 21)
 - **Checkpoint đã lưu**:
-  - Best model: [`checkpoints/best_model.pt`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/checkpoints/best_model.pt) (Epoch 13, `val_acc(nontrivial) = 52,99%`, `val_acc(all) = 55,48%`)
-  - Last model (sau khi resume đến Epoch 22): [`checkpoints/last_model.pt`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/checkpoints/last_model.pt)
+  - Best model: [`checkpoints/best_model.pt`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/checkpoints/best_model.pt) (**Epoch 21**, `val_exact_nontrivial = 54,54%`, `val_exact_all = 56,95%`)
+  - Last model (sau khi resume đến Epoch 22): [`checkpoints/last_model.pt`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/checkpoints/last_model.pt) (**Epoch 22**, `val_exact_nontrivial = 54,12%`, `val_exact_all = 56,55%`, `lr = 0,000100`)
   - Log huấn luyện: [`checkpoints/train_summary.json`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/checkpoints/train_summary.json)
 
 ---
 
 ## 4. Kết Quả Đánh Giá (Offline Test & Đấu Trận Trong Simulator CABT)
 
-File kết quả chi tiết: [`checkpoints/eval_results.json`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/checkpoints/eval_results.json)
+File kết quả chi tiết: [`checkpoints/eval_results.json`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/checkpoints/eval_results.json) (Checkpoint **Epoch 21**, `seed = 42`)
 
 ### 4.1. Độ khớp hành động trên tập Validation & Test (chia theo Episode, `seed = 42`)
 
 | Chỉ số đánh giá | Validation (`6` episodes, `3.001` mẫu) | Test (`6` episodes, `2.452` mẫu) |
 |---|---:|---:|
-| **Exact Match (Tất cả quyết định)** | **55,48%** (`1.665 / 3.001`) | **53,59%** (`1.314 / 2.452`) |
-| **Exact Match (Quyết định không tầm thường `nontrivial`)** | **52,99%** (`1.506 / 2.842`) | **50,84%** (`1.177 / 2.315`) |
-| **Single-Select Exact Match (`maxCount == 1`)** | **55,72%** (`2.796 / 2.859` mẫu) | **53,83%** (`1.245 / 2.313`) |
-| **Multi-Select Exact Match (`maxCount > 1`)** | **50,70%** (`72 / 142`) | **49,64%** (`69 / 139`) |
-| **Multi-Select Jaccard Similarity** | **62,38%** | **61,89%** |
-| **Turn-0 Setup Accuracy (`turn == 0`)** | **83,33%** (`45 / 54`) | **90,00%** (`54 / 60`) |
-| **Main-Game Accuracy (`turn >= 1`)** | **54,97%** (`1.620 / 2.947`) | **52,68%** (`1.260 / 2.392`) |
+| **Loss (`compute_policy_loss`)** | `1,6249` | `1,6691` |
+| **Exact Match (Tất cả quyết định)** | **56,95%** (`1.709 / 3.001`) | **55,06%** (`1.350 / 2.452`) |
+| **Exact Match (Quyết định không tầm thường `nontrivial`)** | **54,54%** (`1.550 / 2.842`) | **52,40%** (`1.213 / 2.315`) |
+| **Single-Select Exact Match (`maxCount == 1`)** | **56,91%** (`1.627 / 2.859`) | **55,47%** (`1.283 / 2.313`) |
+| **Multi-Select Exact Match (`maxCount > 1`)** | **57,75%** (`82 / 142`) | **48,20%** (`67 / 139`) |
+| **Multi-Select Jaccard Similarity** | **67,37%** | **60,38%** |
+| **Zero-Select Accuracy (`gold == []` khi `minCount == 0`)** | **57,14%** (`20 / 35`) | **64,29%** (`9 / 14`) |
+| **Turn-0 Setup Accuracy (`turn == 0`)** | **91,30%** (`63 / 69`) | **88,33%** (`53 / 60`) |
+| **Main-Game Accuracy (`turn >= 1`)** | **56,14%** (`1.646 / 2.932`) | **54,22%** (`1.297 / 2.392`) |
 | **Số hành động không hợp lệ (`invalid_actions`)** | **0** | **0** |
 
-### 4.2. Kết quả Smoke Test & Đấu Trận Trực Tiếp Trong Simulator CABT (`seed = 42`)
+### 4.2. Kết quả Smoke Test & Đấu Trận Mirror-Match Trong Simulator CABT (`seed = 42`)
 
 - **Smoke Test trên CPU** (`python -m src.cli smoke-test --deck deck.csv --checkpoint checkpoints/best_model.pt --seed 42`):
-  - `Random vs Random`: hoàn tất sau `34,47 ms` (`213` steps, `53` turns, `winner = 1`, `invalid_actions = [0, 0]`, `runtime_errors = [0, 0]`).
-  - `Checkpoint Agent vs Random`: hoàn tất sau `237,64 ms` (`199` steps, `27` turns, `winner = 1`, `invalid_actions = [0, 0]`, `runtime_errors = [0, 0]`, độ trễ trung bình `1,67 ms/quyết định`).
-- **Đánh giá 80 trận ghép cặp đổi chỗ (Seat-Swapped Paired Matches, `40` trận / đối thủ, luân phiên Seat 0 và Seat 1 trên 3 bộ bài hợp lệ `deck.csv`, `dragapult_deck.csv`, `starmie_deck.csv`)**:
+  - `Random vs Random`: hoàn tất sau `30,04 ms` (`203` steps, `64` turns, `winner = 0`, `decks_equal = true`, `invalid_actions = [0, 0]`, `runtime_errors = [0, 0]`).
+  - `Checkpoint Agent vs Random`: hoàn tất sau `171,34 ms` (`178` steps, `33` turns, `winner = 0`, `decks_equal = true`, `invalid_actions = [0, 0]`, `runtime_errors = [0, 0]`, độ trễ trung bình `1,53 ms/quyết định`).
+- **Đánh giá 84 trận Mirror-Match thật (`decks_equal == True`, `42` trận / đối thủ = `14` trận / bộ bài x `3` bộ bài `default_deck`, `dragapult_deck`, `starmie_deck`, luân phiên Seat 0 và Seat 1)**:
 
-| Đối thủ Baseline | Số trận | Thắng - Hòa - Thua | Tỷ lệ thắng (`Win Rate`) | Kết quả khi đi Seat 0 (W-D-L) | Kết quả khi đi Seat 1 (W-D-L) | Lỗi hành động (`invalid_actions`) | Lỗi chạy trận (`runtime_errors`) | Độ trễ TB / nước đi |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **CABT Random Baseline** | **40** | **30 - 0 - 10** | **75,00%** | `13 - 0 - 7` | `17 - 0 - 3` | **0** | **0** | `1,17 ms` |
-| **Rule-Based Heuristic Baseline** | **40** | **26 - 0 - 14** | **65,00%** | `14 - 0 - 6` | `12 - 0 - 8` | **0** | **0** | `1,17 ms` |
+| Đối thủ Baseline | Số trận | Thắng - Hòa - Thua | Timeouts | Tỷ lệ thắng (`Win Rate`) | Khi đi Seat 0 (W-D-L) | Khi đi Seat 1 (W-D-L) | Lỗi hợp lệ (`invalid_actions`) | Lỗi runtime (`runtime_errors`) | Số turn / step TB | Độ trễ TB / nước đi |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **CABT Random Baseline** | **42** | **35 - 0 - 7** | **0** | **83,33%** | `16 - 0 - 5` | `19 - 0 - 2` | **0** | **0** | `19,55` turns / `119,07` steps | `1,218 ms` |
+| **Rule-Based Heuristic Baseline** | **42** | **33 - 0 - 9** | **0** | **78,57%** | `15 - 0 - 6` | `18 - 0 - 3` | **0** | **0** | `17,55` turns / `112,48` steps | `1,336 ms` |
+
+#### Chi tiết theo từng bộ bài (`by_deck`, `14` trận mirror-match / bộ bài / đối thủ):
+
+| Bộ bài (`Mirror Match: decks_equal == True`) | Đấu với **CABT Random Baseline** (W-D-L / Win Rate) | Đấu với **Heuristic Baseline** (W-D-L / Win Rate) | Timeouts |
+|---|---:|---:|---:|
+| **`default_deck`** (`deck.csv` — Top Meta Dragapult/Munkidori) | **13 - 0 - 1** (**92,86%**) | **13 - 0 - 1** (**92,86%**) | **0** |
+| **`dragapult_deck`** (`decks/dragapult_deck.csv`) | **12 - 0 - 2** (**85,71%**) | **12 - 0 - 2** (**85,71%**) | **0** |
+| **`starmie_deck`** (`decks/starmie_deck.csv`) | **10 - 0 - 4** (**71,43%**) | **8 - 0 - 6** (**57,14%**) | **0** |
+| **Tổng cộng (`3` bộ bài)** | **35 - 0 - 7** (**83,33%**) | **33 - 0 - 9** (**78,57%**) | **0** |
 
 ---
 
@@ -134,9 +146,9 @@ python -m src.cli train --data-dir data/processed --checkpoint-dir checkpoints -
 # 5. Chạy smoke test trên CPU trong simulator CABT
 python -m src.cli smoke-test --deck deck.csv --checkpoint checkpoints/best_model.pt --seed 42
 
-# 6. Đánh giá trên tập test giữ lại và đấu 80 trận với các agent baseline trong simulator
-python -m src.cli evaluate --checkpoint checkpoints/best_model.pt --games 40 --seed 42 --out-file checkpoints/eval_results.json
+# 6. Đánh giá trên tập test giữ lại và đấu 84 trận mirror-match (42 trận/đối thủ) trong simulator
+python -m src.cli evaluate --checkpoint checkpoints/best_model.pt --games 42 --seed 42 --out-file checkpoints/eval_results.json
 
-# 7. Chạy bộ kiểm thử tự động pytest
+# 7. Chạy bộ kiểm thử tự động pytest (10/10 tests)
 python -m pytest -p no:cacheprovider -v tests/test_pipeline.py
 ```

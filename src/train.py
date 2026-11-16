@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import random
 import subprocess
 import time
@@ -61,17 +60,17 @@ def slice_packed_batch(
     board_cards = data["board_cards"][idx_t].to(device)
     select_ctx = data["select_ctx"][idx_t].to(device)
     select_type = data["select_type"][idx_t].to(device)
-    min_count = data["min_count"][idx_t]
-    max_count = data["max_count"][idx_t]
+    min_count = data["min_count"][idx_t].to(device)
+    max_count = data["max_count"][idx_t].to(device)
     num_options = data["num_options"][idx_t].to(device)
 
     offsets = data["offsets"]
-    opt_ConstantSlices = []
+    opt_slices = []
     for i in indices:
         s = int(offsets[i].item())
         e = int(offsets[i + 1].item())
-        opt_ConstantSlices.append(torch.arange(s, e, dtype=torch.long))
-    flat_idx = torch.cat(opt_ConstantSlices, dim=0)
+        opt_slices.append(torch.arange(s, e, dtype=torch.long))
+    flat_idx = torch.cat(opt_slices, dim=0)
 
     opt_feats = data["opt_feats"][flat_idx].to(device)
     opt_card_ids = data["opt_card_ids"][flat_idx].to(device)
@@ -103,21 +102,32 @@ def compute_policy_loss(
     stop_logits: torch.Tensor,
     num_options: torch.Tensor,
     chosen_mask: torch.Tensor,
+    min_count: torch.Tensor | None = None,
+    max_count: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Vectorized listwise cross-entropy + relative stop-threshold BCE loss."""
+    """Vectorized listwise cross-entropy (with explicit stop token for minCount==0)
+    plus unbiased relative stop-threshold BCE loss.
+    """
     device = opt_logits.device
     batch_size = int(num_options.size(0))
     max_opts = int(num_options.max().item())
 
-    # 1. Relative stop-threshold BCE loss: chosen options should exceed stop_logit
+    # 1. Unbiased relative stop-threshold BCE loss (`pos_weight = 1.0` so threshold is P=0.5)
     stop_rep = torch.repeat_interleave(stop_logits, num_options, dim=0)
     rel_logits = opt_logits - stop_rep
-    pos_weight = ((1.0 - chosen_mask).sum() / chosen_mask.sum().clamp(min=1.0)).clamp(1.0, 5.0)
-    bce_loss = F.binary_cross_entropy_with_logits(rel_logits, chosen_mask, pos_weight=pos_weight)
+    raw_bce = F.binary_cross_entropy_with_logits(rel_logits, chosen_mask, reduction="none")
 
-    # 2. Segmented listwise cross-entropy over legal options
-    padded_logits = torch.full((batch_size, max_opts), -1e9, device=device, dtype=opt_logits.dtype)
-    padded_targets = torch.zeros((batch_size, max_opts), device=device, dtype=opt_logits.dtype)
+    if min_count is not None and max_count is not None:
+        is_var = (min_count.to(device) < max_count.to(device)).float()
+        sample_weights = 0.25 + 1.75 * is_var  # Emphasize variable-count prompts (`min < max`)
+        opt_weights = torch.repeat_interleave(sample_weights, num_options, dim=0)
+        bce_loss = (raw_bce * opt_weights).sum() / opt_weights.sum().clamp(min=1.0)
+    else:
+        bce_loss = raw_bce.mean()
+
+    # 2. Segmented listwise cross-entropy over legal options + explicit stop column `max_opts` when minCount==0
+    padded_logits = torch.full((batch_size, max_opts + 1), -1e9, device=device, dtype=opt_logits.dtype)
+    padded_targets = torch.zeros((batch_size, max_opts + 1), device=device, dtype=opt_logits.dtype)
 
     row_ids = torch.repeat_interleave(torch.arange(batch_size, device=device), num_options)
     cum_opts = torch.cumsum(num_options, dim=0) - num_options
@@ -126,14 +136,21 @@ def compute_policy_loss(
     padded_logits[row_ids, col_ids] = opt_logits
     padded_targets[row_ids, col_ids] = chosen_mask
 
-    target_sums = padded_targets.sum(dim=1, keepdim=True)
-    has_pos = (target_sums.squeeze(-1) > 0)
-    if has_pos.any():
-        norm_targets = padded_targets[has_pos] / target_sums[has_pos].clamp(min=1.0)
-        log_probs = F.log_softmax(padded_logits[has_pos], dim=-1)
-        ce_loss = -(norm_targets * log_probs).sum(dim=-1).mean()
+    # Enable the virtual stop option at column `max_opts` when `min_count == 0` (or when target_sums == 0)
+    target_sums = padded_targets[:, :max_opts].sum(dim=1)
+    is_empty_choice = (target_sums == 0)
+    if min_count is not None:
+        allow_zero = (min_count.to(device) == 0) | is_empty_choice
     else:
-        ce_loss = torch.tensor(0.0, device=device)
+        allow_zero = is_empty_choice
+
+    padded_logits[allow_zero, max_opts] = stop_logits[allow_zero]
+    padded_targets[is_empty_choice, max_opts] = 1.0
+
+    full_sums = padded_targets.sum(dim=1, keepdim=True).clamp(min=1.0)
+    norm_targets = padded_targets / full_sums
+    log_probs = F.log_softmax(padded_logits, dim=-1)
+    ce_loss = -(norm_targets * log_probs).sum(dim=-1).mean()
 
     return ce_loss + 0.5 * bce_loss
 
@@ -163,6 +180,9 @@ def evaluate_packed_split(
     multi_jaccard_sum = 0.0
     multi_total = 0
 
+    zero_select_correct = 0
+    zero_select_total = 0
+
     turn0_correct = 0
     turn0_total = 0
     main_correct = 0
@@ -189,7 +209,12 @@ def evaluate_packed_split(
             batch["opt_attack_ids"],
         )
         loss = compute_policy_loss(
-            opt_logits, stop_logits, batch["num_options"], batch["chosen_mask"]
+            opt_logits,
+            stop_logits,
+            batch["num_options"],
+            batch["chosen_mask"],
+            batch["min_count"],
+            batch["max_count"],
         )
         total_loss += float(loss.item())
         n_batches += 1
@@ -197,8 +222,8 @@ def evaluate_packed_split(
         logits_cpu = opt_logits.cpu().numpy()
         stop_cpu = stop_logits.cpu().numpy()
         num_opts_cpu = batch["num_options"].cpu().numpy()
-        min_c_cpu = batch["min_count"].numpy()
-        max_c_cpu = batch["max_count"].numpy()
+        min_c_cpu = batch["min_count"].cpu().numpy()
+        max_c_cpu = batch["max_count"].cpu().numpy()
 
         cursor = 0
         for bi, global_i in enumerate(batch_idx):
@@ -225,6 +250,11 @@ def evaluate_packed_split(
             is_exact = (sorted(pred) == sorted(gold))
             if is_exact:
                 exact_all += 1
+
+            if len(gold) == 0:
+                zero_select_total += 1
+                if len(pred) == 0:
+                    zero_select_correct += 1
 
             if not forced_np[global_i]:
                 n_nontrivial += 1
@@ -258,15 +288,24 @@ def evaluate_packed_split(
         "num_samples": n_total,
         "num_nontrivial": n_nontrivial,
         "exact_match_all": exact_all / max(n_total, 1),
+        "exact_match_all_count": exact_all,
         "exact_match_nontrivial": exact_nontrivial / max(n_nontrivial, 1),
+        "exact_match_nontrivial_count": exact_nontrivial,
         "single_select_acc": single_correct / max(single_total, 1),
+        "single_select_correct": single_correct,
         "single_select_total": single_total,
         "multi_select_exact_acc": multi_exact / max(multi_total, 1),
+        "multi_select_exact_count": multi_exact,
         "multi_select_jaccard": multi_jaccard_sum / max(multi_total, 1),
         "multi_select_total": multi_total,
+        "zero_select_acc": zero_select_correct / max(zero_select_total, 1),
+        "zero_select_correct": zero_select_correct,
+        "zero_select_total": zero_select_total,
         "turn0_setup_acc": turn0_correct / max(turn0_total, 1),
+        "turn0_setup_correct": turn0_correct,
         "turn0_setup_total": turn0_total,
         "main_game_acc": main_correct / max(main_total, 1),
+        "main_game_correct": main_correct,
         "main_game_total": main_total,
         "invalid_actions": invalid_predictions,
     }
@@ -315,7 +354,10 @@ def train_policy(
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            # Fix BUG-5: update T_max to the new total epochs so CosineAnnealingLR does not bounce upward
+            scheduler.T_max = max(epochs, start_epoch)
         start_epoch = int(ckpt.get("epoch", 0)) + 1
+        scheduler.T_max = max(epochs, start_epoch)
         best_val_acc = float(ckpt.get("best_val_acc", -1.0))
         history = list(ckpt.get("history", []))
         if "default_deck" in ckpt and len(ckpt["default_deck"]) == 60:
@@ -354,7 +396,12 @@ def train_policy(
                 batch["opt_attack_ids"],
             )
             loss = compute_policy_loss(
-                opt_logits, stop_logits, batch["num_options"], batch["chosen_mask"]
+                opt_logits,
+                stop_logits,
+                batch["num_options"],
+                batch["chosen_mask"],
+                batch["min_count"],
+                batch["max_count"],
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -363,7 +410,10 @@ def train_policy(
             ep_loss += float(loss.item())
             n_steps += 1
 
-        scheduler.step()
+        # Keep CosineAnnealingLR bounded at eta_min if last_epoch reaches T_max
+        if scheduler.last_epoch < scheduler.T_max:
+            scheduler.step()
+
         train_time = time.perf_counter() - t_ep
         samples_per_sec = n_train / max(train_time, 1e-6)
         peak_vram_mb = (
@@ -384,19 +434,20 @@ def train_policy(
             "val_single_acc": val_metrics["single_select_acc"],
             "val_multi_exact_acc": val_metrics["multi_select_exact_acc"],
             "val_multi_jaccard": val_metrics["multi_select_jaccard"],
+            "val_zero_select_acc": val_metrics["zero_select_acc"],
             "val_invalid_actions": val_metrics["invalid_actions"],
             "epoch_time_sec": round(train_time, 4),
             "samples_per_sec": round(samples_per_sec, 1),
             "peak_vram_mb": round(peak_vram_mb, 2),
-            "lr": float(scheduler.get_last_lr()[0]),
+            "lr": float(optimizer.param_groups[0]["lr"]),
         }
         history.append(row)
         print(
             f"[Epoch {epoch:02d}/{epochs:02d}] "
             f"train_loss={row['train_loss']:.4f} val_loss={row['val_loss']:.4f} "
             f"val_acc(nontrivial)={val_acc*100:.2f}% val_acc(all)={row['val_exact_all']*100:.2f}% "
-            f"multi_acc={row['val_multi_exact_acc']*100:.2f}% "
-            f"speed={samples_per_sec:.0f} samp/s vram={peak_vram_mb:.1f}MB"
+            f"multi_acc={row['val_multi_exact_acc']*100:.2f}% zero_acc={row['val_zero_select_acc']*100:.1f}% "
+            f"speed={samples_per_sec:.0f} samp/s vram={peak_vram_mb:.1f}MB lr={row['lr']:.6f}"
         )
 
         ckpt_payload = {

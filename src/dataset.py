@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from src import DATASET_REF, DATASET_VERSION
-from src.features import extract_decision_features, validate_no_leakage
+from src.features import extract_decision_features, int_or, validate_no_leakage
 
 
 def download_replays_from_kaggle(
@@ -65,17 +65,7 @@ def parse_single_replay(
     filepath: str | Path,
     drop_forced_single: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int], list[list[int]]]:
-    """Parse a single replay JSON file into decision samples and step accounting.
-
-    In `kaggle-environments` CABT replays:
-    - `steps[t][seat]` holds the pre-decision `status` and `observation` at step `t`.
-    - When `steps[t][seat]["status"] == "ACTIVE"`, the action chosen by `seat` in
-      response to `steps[t][seat]["observation"]` is stored at `steps[t + 1][seat]["action"]`.
-    - At `t == 0`, both seats have `current=None, select=None` and `steps[1][seat]["action"]`
-      is the 60-card deck (`list[int]`).
-    - When `steps[t][seat]["status"] == "INACTIVE"`, the player is waiting (`steps[t + 1][seat]["action"] == []`).
-    - At `t == len(steps) - 1`, `status == "DONE"` (terminal step).
-    """
+    """Parse a single replay JSON file into decision samples and step accounting."""
     path = Path(filepath)
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
@@ -138,9 +128,9 @@ def parse_single_replay(
             validate_no_leakage(obs, expected_seat=seat)
 
             opts = sel.get("option") or []
-            min_c = int(sel.get("minCount") or 0)
-            max_c = int(sel.get("maxCount") or 1)
-            turn = int(cur.get("turn") or 0)
+            min_c = int_or(sel, "minCount", 0)
+            max_c = int_or(sel, "maxCount", 1)
+            turn = int_or(cur, "turn", 0)
 
             # Validate action against legal options and [minCount, maxCount]
             if not isinstance(next_act, list):
