@@ -19,7 +19,9 @@ Huấn luyện và đánh giá một agent chọn hành động hợp lệ trong
 
 ## Chạy trên Colab Pro
 
-- Đặt logic tải dữ liệu, tiền xử lý, train, resume và eval vào script Python chạy từ CLI. Dùng CPU cho kiểm tra replay và tiền xử lý ban đầu. Dùng GPU cho train sau khi lần chạy thử thành công và xác minh accelerator trong runtime.
+- Đặt logic tải dữ liệu, tiền xử lý, train, resume và eval vào script Python chạy từ CLI.
+- Dùng **CPU** cho kiểm tra replay mẫu, tiền xử lý ban đầu và smoke test simulator. Khi các bước này thành công, ưu tiên **một NVIDIA T4** cho lần train baseline nếu Colab cấp được.
+- Kiểm tra GPU và VRAM thực tế bằng `nvidia-smi`. Chạy một đoạn train ngắn để đo tốc độ và VRAM đỉnh, rồi ước tính thời gian chạy đầy đủ. Nếu T4 không khả dụng, chọn GPU phù hợp từ các runtime tài khoản có thể dùng. Nếu thiếu VRAM hoặc train quá chậm, cân nhắc GPU khác dựa trên VRAM cần thiết, thời gian dự kiến và mức tiêu thụ compute units nếu có số liệu.
 - Ưu tiên [Colab MCP chính thức](https://developers.google.com/colab/api/reference/mcp) khi đã cấu hình và xác thực bằng tài khoản có Colab Pro. Kiểm tra `get_subscription`, `list_runtimes` và `list_runtime_specs` trước khi chọn runtime. Tái sử dụng runtime phù hợp, chuyển mã theo một commit xác định hoặc tải mã vào runtime, rồi gọi CLI bằng `execute_code` trong session đó.
 - Với lần chạy dài qua MCP, dùng `session` và `executionId`. Khi gặp `DEADLINE_EXCEEDED` hoặc `UNAVAILABLE`, gửi lại đúng lời gọi với cùng ID để nối lại. Khi runtime đã mất, tiếp tục từ checkpoint đã lưu. Lưu định kỳ checkpoint có trạng thái đủ để resume, cấu hình và metrics vào Google Drive hoặc nơi lưu trữ bền vững đã được cấu hình. Kiểm tra đọc lại được checkpoint trên phiên mới.
 - Khi MCP chưa dùng được, tạo một notebook Colab mỏng để nạp mã, cấu hình lưu trữ, kiểm tra thiết bị và gọi cùng các lệnh CLI. Người dùng mở notebook, chọn runtime và bấm **Run all**. Giữ logic train trong repo.
