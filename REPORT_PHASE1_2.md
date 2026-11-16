@@ -3,7 +3,7 @@
 ## 1. Tổng Quan & Đối Chiếu Dữ Liệu / Simulator
 
 - **Dataset Kaggle**: [`kaggle/the-pokemon-company-ptcg-ai-battle-challenge-playground-episodes-2026-11-13`](https://www.kaggle.com/datasets/kaggle/the-pokemon-company-ptcg-ai-battle-challenge-playground-episodes-2026-11-13) — **Version 1** (`2026-11-13-v1`), gồm `manifest.csv` (1.644 episodes) và các file JSON replay định dạng `kaggle-environments`.
-- **Cấu hình Phiên bản & Tái lập**: `dataset_version = 2026-11-13-v1`, `seed = 42`, nhánh Git `ao/quy-t-c/root` (commit nền `f96eb6201876b27c7f9e80a5ed52781bb913d820`, cập nhật bản vá toàn diện `BUG-1..BUG-7`; mã `git_commit` của `HEAD` hiện tại được lưu tự động trong `checkpoints/eval_results.json`).
+- **Cấu hình Phiên bản & Tái lập**: `dataset_version = 2026-11-13-v1`, `seed = 42`, nhánh Git `ao/quy-t-c/root` (commit nền `f96eb6201876b27c7f9e80a5ed52781bb913d820`, commit bản vá `BUG-1..BUG-7` đã kiểm chứng bởi Reviewer: `02035ac00469b00c53c52ff0045ee2d18548fab9`, báo cáo rà soát hồi quy tại [`REVIEW_REPORT.md`](file:///Z:/Word-by-Word%20Video%20Supercut/.ao-local/data/worktrees/tcg-train/tcg-train-5/REVIEW_REPORT.md)).
 - **Simulator Engine**: **CABT Engine** (`cg` package: `cg/api.py`, `cg/game.py`, `cg/sim.py`, `cg/utils.py`, cùng thư viện biên dịch `cg/cg.dll` cho Windows và `cg/libcg.so` cho Linux/Colab).
 - **Xác minh cơ chế ghép `observation` – `action` trên replay thật**:
   - Mỗi episode là một trận đấu BO3 (`configuration.bo = 3`, `version = 2`), gồm danh sách `steps[0 .. T-1]`, mỗi bước có 2 phần tử cho `seat 0` và `seat 1`.

@@ -27,7 +27,7 @@
 ### 2.1. Lịch sử Commit
 - `a28d144` — `initial commit`
 - `f96eb62` — `Implement end-to-end Pokemon TCG CABT imitation learning baseline and evaluation`
-- Bản cập nhật hiện tại trên nhánh `ao/quy-t-c/root` — Đã xử lý triệt để toàn bộ **7 bugs (`BUG-1` .. `BUG-7`)** do Reviewer (`gemini-4-hydrogen-high`) phát hiện, đồng bộ `notebooks/colab_train_eval.ipynb`, chạy lại `smoke-test`, `evaluate` (`42` trận/đối thủ, `seed=42`), và `pytest` (`10/10 PASSED`).
+- `02035ac` (`02035ac00469b00c53c52ff0045ee2d18548fab9`) — `Fix 7 review bugs (mirror eval, falsy-zero, ID bounds, stop loss, resume LR, stadium, docs)` (Đã được Reviewer `gemini-4-hydrogen-high` xác nhận **Regression Review PASS 7/7 bugs, 0 hồi quy** tại `REVIEW_REPORT.md`).
 
 ### 2.2. Bảng Trạng Thái Các Hạng Mục
 
