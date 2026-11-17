@@ -10,10 +10,10 @@ The project provides a self-contained CLI pipeline (`src/cli.py`) designed for m
 
 1. **Scalable Data Download (`download-data`)**: Downloads `manifest.csv` (`1,644` episodes, `2026-11-13-v1`) and replay JSON files from Kaggle with `--num-top`, `--num-strided`, and `--max-episodes` (up to all `1,644` episodes) for diverse meta deck coverage.
 2. **Sharded Streaming Preprocessing & Episode-Level Splitting (`preprocess`)**:
-   - Infers static fallback metadata (`infer_fallback_metadata_from_replays`) for post-`cg.dll` card/attack IDs (`cardId > 1267`, `attackId > 1556`).
+   - Splits `train / val / test` **strictly by `episode_id`** before unpacking decision steps.
+   - Infers fallback metadata (`infer_fallback_metadata_from_replays`) strictly from `train` split episodes (without overwriting curated `FALLBACK_CARD_DB`/`FALLBACK_ATTACK_DB`) for post-`cg.dll` IDs (`cardId > 1267`, `attackId > 1556`).
    - Streams one replay JSON at a time, aligns pre-decision observations `steps[t][seat]["observation"]` with chosen actions `steps[t + 1][seat]["action"]`, and writes bounded shards (`train_shard_*.pt`, `val_shard_*.pt`, `test_shard_*.pt` + `*_shards.json`) so Peak CPU RAM stays `O(1 shard)`.
    - Enforces **Zero Leakage** (`validate_no_leakage`): verifies no future-step access and confirms opponent hidden state remains masked (`players[1 - seat]["hand"] is None`).
-   - Splits `train / val / test` **strictly by `episode_id`** before unpacking decision steps.
 3. **Imitation Learning Policy (`PTCGPolicyNet` — `src/model.py`)**:
    - **Enriched State & Option Encoders**: `112`-dimensional dense state vector (turn flags, `SelectType`, `minCount`/`maxCount`, active & per-slot bench HP/damage/energy/stage, public discard counts, and causal turn action history from `obs["logs"]`) and `64`-dimensional option features (stage, energy-type matching, energy deficit, damage/HP ratio, duplicate counts, `AreaType.STADIUM = 7`, `2x` Weakness, Lethal KO) with Entity Embeddings (`MAX_CARD_ID = 2048`, `MAX_ATTACK_ID = 2048`).
    - **Set-Context Self-Attention & Conditional Multi-Select**: `opt_attn` (4-head self-attention across candidate options) and `cond_scorer` / `cond_stop_head` for context-aware sequential multi-select decoding (`2 <= maxCount <= 6`).
@@ -50,29 +50,29 @@ The project provides a self-contained CLI pipeline (`src/cli.py`) designed for m
 
 ---
 
-## 3. Benchmark Results Summary (Phase 2 vs Phase 3, `seed = 42`)
+## 3. Benchmark Results Summary (Phase 2 vs Phase 3, `seed = 42`, Code Commit `c410ec8`)
 
 - **Phase 3 Dataset (`209` diverse episodes, `seed = 42`)**: `93,829` frames (`187,658` seat-steps) -> **`90,609` kept decisions** (`61,890` train across `5` shards / `13,970` val / `14,749` test; `5,707` multi-select decisions), `0` invalid action bounds, `100%` episode-disjoint splits.
 - **Training & GPU Efficiency (`RTX 4050`, PyTorch `2.6.0+cu124`)**:
-  - **BC (`20` epochs + `2` resume epochs)**: `3,126 – 5,595 samples/sec`, Peak VRAM **`88.00 MB`**, `best_bc_model.pt` at Epoch 22 (`val_exact_nontrivial = 60.55%`, `val_exact_all = 62.43%`, `val_multi_exact_acc = 62.39%`).
-  - **RL Fine-Tuning (`train-rl`, `10` updates + `2` resume updates)**: Peak VRAM **`42.41 MB`**, improving fast-eval win rate vs Heuristic from `94.44%` (BC) to **`100.00%`** (`best_rl_model.pt` promoted to `checkpoints/best_model.pt`, Epoch 22 + RL Update 8).
+  - **BC (`20` epochs + `2` resume epochs)**: `2,655.3 – 5,800.7 samples/sec`, Peak VRAM **`88.00 MB`**, `best_bc_model.pt` at Epoch 22 (`val_exact_nontrivial = 61.01%`, `val_exact_all = 62.86%`, `val_multi_exact_acc = 60.98%`).
+  - **RL Fine-Tuning (`train-rl`, `10` updates + `2` resume updates)**: Peak VRAM **`42.70 MB`**, improving fast-eval win rate vs Heuristic from `88.89%` (BC) to **`100.00%`** (`best_rl_model.pt` at RL Update 5 promoted to `checkpoints/best_model.pt`).
 
-| Metric | Phase 2 (`40` eps, Ep 21) | Phase 3 Final (`209` eps, Ep 22 + RL Upd 8) | Delta |
-|---|---:|---:|---:|
-| **Offline Test `exact_match_all`** | `55.06%` (`1,350/2,452`) | **`61.12%`** (`9,014/14,749`) | **`+6.06%`** |
-| **Offline Test `exact_match_nontrivial`** | `52.40%` (`1,213/2,315`) | **`59.27%`** (`8,345/14,080`) | **`+6.87%`** |
-| **Test `single_select_acc`** | `55.47%` (`1,283/2,313`) | **`61.05%`** (`8,407/13,770`) | **`+5.58%`** |
-| **Test `multi_select_exact_acc`** | `48.20%` (`67/139`) | **`62.00%`** (`607/979`) | **`+13.80%`** |
-| **Test `multi_select_jaccard`** | `60.38%` | **`73.89%`** | **`+13.51%`** |
-| **Mirror vs `cabt_random_baseline` (`42` games)** | `83.33%` (`35-0-7`) | **`97.62%`** (`41-0-1`) | **`+14.29%`** |
-| **Mirror vs `heuristic_baseline` (`42` games)** | `78.57%` (`33-0-9`) | **`92.86%`** (`39-0-3`) | **`+14.29%`** |
-| — `default_deck` vs Heuristic (`14` games) | `92.86%` (`13-0-1`) | **`100.00%`** (`14-0-0`) | **`+7.14%`** |
-| — `dragapult_deck` vs Heuristic (`14` games) | `85.71%` (`12-0-2`) | **`100.00%`** (`14-0-0`) | **`+14.29%`** |
-| — `starmie_deck` vs Heuristic (`14` games) | `57.14%` (`8-0-6`) | **`78.57%`** (`11-0-3`) | **`+21.43%`** |
-| **Cross-Deck Matrix vs Heuristic (`54` games)** | *(N/A)* | **`90.74%`** (`49-0-5`) | **New** |
-| **CPU Inference Latency (`4,908` mirror decisions)** | `1.22–1.34 ms` mean | **`4.39 ms` mean / `14.48 ms` P99** | Within limit |
-| **Invalid Actions / Runtime Errors / Timeouts** | `0 / 0 / 0` | **`0 / 0 / 0`** | **Zero faults** |
-| **Automated Test Suite (`pytest`)** | `10/10 PASSED` | **`15/15 PASSED` (`27.05s`)** | All pass |
+| Metric | Phase 2 (`40` eps, Ep 21) | Phase 3 BC (`209` eps, Ep 22) | Phase 3 Final RL (`Ep 22 + RL Upd 5`) | Delta (P3 Final vs P2) |
+|---|---:|---:|---:|---:|
+| **Offline Test `exact_match_all`** | `55.06%` (`1,350/2,452`) | `62.87%` (`9,273/14,749`) | **`61.53%`** (`9,075/14,749`) | **`+6.47%`** |
+| **Offline Test `exact_match_nontrivial`** | `52.40%` (`1,213/2,315`) | `61.11%` (`8,604/14,080`) | **`59.70%`** (`8,406/14,080`) | **`+7.30%`** |
+| **Test `single_select_acc`** | `55.47%` (`1,283/2,313`) | `62.91%` (`8,663/13,770`) | **`61.65%`** (`8,489/13,770`) | **`+6.18%`** |
+| **Test `multi_select_exact_acc`** | `48.20%` (`67/139`) | `62.31%` (`610/979`) | **`59.86%`** (`586/979`) | **`+11.66%`** |
+| **Test `multi_select_jaccard`** | `60.38%` | `74.45%` | **`72.87%`** | **`+12.49%`** |
+| **Mirror vs `cabt_random_baseline` (`42` games)** | `83.33%` (`35-0-7`) | `97.62%` (`41-0-1`) | **`92.86%`** (`39-0-3`) | **`+9.53%`** |
+| **Mirror vs `heuristic_baseline` (`42` games)** | `78.57%` (`33-0-9`) | `85.71%` (`36-0-6`) | **`88.10%`** (`37-0-5`) | **`+9.53%`** |
+| — `default_deck` vs Heuristic (`14` games) | `92.86%` (`13-0-1`) | `100.00%` (`14-0-0`) | **`92.86%`** (`13-0-1`) | `0.00%` |
+| — `dragapult_deck` vs Heuristic (`14` games) | `85.71%` (`12-0-2`) | `85.71%` (`12-0-2`) | **`85.71%`** (`12-0-2`) | `0.00%` |
+| — `starmie_deck` vs Heuristic (`14` games) | `57.14%` (`8-0-6`) | `71.43%` (`10-0-4`) | **`85.71%`** (`12-0-2`) | **`+28.57%`** |
+| **Cross-Deck Matrix vs Heuristic (`54` games)** | *(N/A)* | `83.33%` (`45-0-9`) | **`92.59%`** (`50-0-4`) | **New (`+9.26%` vs BC)** |
+| **CPU Inference Latency (`5,007` mirror decisions)** | `1.22–1.34 ms` mean | `2.00 ms` mean / `3.58 ms` P99 | **`1.92 ms` mean / `3.14 ms` P99** | Within limit |
+| **Invalid Actions / Runtime Errors / Timeouts** | `0 / 0 / 0` | `0 / 0 / 0` | **`0 / 0 / 0`** | **Zero faults** |
+| **Automated Test Suite (`pytest`)** | `10/10 PASSED` | — | **`15/15 PASSED` (`19.34s`)** | All pass |
 
 ---
 
