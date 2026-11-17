@@ -12,7 +12,7 @@ import torch
 
 from src import DATASET_REF, DATASET_VERSION
 from src.dataset import get_split_shard_paths
-from src.features import get_attack_db, int_or
+from src.features import get_attack_db, int_or, load_inferred_metadata_json
 from src.train import (
     evaluate_packed_split,
     get_git_commit,
@@ -345,6 +345,7 @@ def evaluate_in_simulator(
     model, default_deck, ckpt = load_policy_from_checkpoint(checkpoint_path, device="cpu")
 
     data_path = Path(data_dir)
+    load_inferred_metadata_json(data_path / "inferred_metadata.json")
     offline_test: dict[str, Any] = {}
     offline_val: dict[str, Any] = {}
     try:

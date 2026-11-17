@@ -144,8 +144,8 @@ def _load_cg_attack_db() -> dict[int, Any]:
 @lru_cache(maxsize=1)
 def get_card_db() -> dict[int, Any]:
     """Load card metadata dictionary `{cardId: CardData}` merged with fallback metadata."""
-    merged: dict[int, Any] = dict(FALLBACK_CARD_DB)
-    merged.update(_RUNTIME_CARD_OVERRIDES)
+    merged: dict[int, Any] = dict(_RUNTIME_CARD_OVERRIDES)
+    merged.update(FALLBACK_CARD_DB)
     merged.update(_load_cg_card_db())
     return merged
 
@@ -153,8 +153,8 @@ def get_card_db() -> dict[int, Any]:
 @lru_cache(maxsize=1)
 def get_attack_db() -> dict[int, Any]:
     """Load attack metadata dictionary `{attackId: Attack}` merged with fallback metadata."""
-    merged: dict[int, Any] = dict(FALLBACK_ATTACK_DB)
-    merged.update(_RUNTIME_ATTACK_OVERRIDES)
+    merged: dict[int, Any] = dict(_RUNTIME_ATTACK_OVERRIDES)
+    merged.update(FALLBACK_ATTACK_DB)
     merged.update(_load_cg_attack_db())
     return merged
 
@@ -162,28 +162,72 @@ def get_attack_db() -> dict[int, Any]:
 def register_fallback_metadata(
     cards: dict[int, FallbackCardMeta] | None = None,
     attacks: dict[int, FallbackAttackMeta] | None = None,
+    overwrite_curated: bool = False,
 ) -> None:
-    """Register additional fallback metadata entries and invalidate cached lookups."""
+    """Register additional fallback metadata entries without overwriting curated tables."""
     if cards:
-        _RUNTIME_CARD_OVERRIDES.update(cards)
+        for cid, meta in cards.items():
+            if overwrite_curated or cid not in FALLBACK_CARD_DB:
+                _RUNTIME_CARD_OVERRIDES[cid] = meta
     if attacks:
-        _RUNTIME_ATTACK_OVERRIDES.update(attacks)
+        for aid, meta in attacks.items():
+            if overwrite_curated or aid not in FALLBACK_ATTACK_DB:
+                _RUNTIME_ATTACK_OVERRIDES[aid] = meta
     get_card_db.cache_clear()
     get_attack_db.cache_clear()
 
 
+def load_inferred_metadata_json(path: str | Path) -> None:
+    """Load train-inferred unseen card/attack metadata JSON if present."""
+    p = Path(path)
+    if not p.exists():
+        return
+    with open(p, encoding="utf-8") as f:
+        data = json.load(f)
+    cards: dict[int, FallbackCardMeta] = {}
+    for k, v in (data.get("cards") or {}).items():
+        cid = int(k)
+        cards[cid] = FallbackCardMeta(
+            cardId=cid,
+            cardType=int(v.get("cardType", 0)),
+            hp=int(v.get("hp", 0)),
+            ex=bool(v.get("ex", False)),
+            basic=bool(v.get("basic", True)),
+            stage=int(v.get("stage", 0)),
+            attacks=tuple(int(a) for a in (v.get("attacks") or ())),
+            skills=tuple(int(s) for s in (v.get("skills") or ())),
+            name=f"FallbackCard_{cid}",
+        )
+    attacks: dict[int, FallbackAttackMeta] = {}
+    for k, v in (data.get("attacks") or {}).items():
+        aid = int(k)
+        attacks[aid] = FallbackAttackMeta(
+            attackId=aid,
+            damage=int(v.get("damage", 0)),
+            energies=tuple(int(e) for e in (v.get("energies") or ())),
+            name=f"FallbackAttack_{aid}",
+        )
+    register_fallback_metadata(cards, attacks, overwrite_curated=False)
+
+
 def infer_fallback_metadata_from_replays(
-    replay_dir: str | Path,
+    replay_dir: str | Path | None = None,
     max_files: int = 300,
+    replay_files: list[str | Path] | None = None,
 ) -> tuple[dict[int, FallbackCardMeta], dict[int, FallbackAttackMeta]]:
     """Infer card and attack metadata for IDs absent from legacy `cg.api` using replay logs."""
     cg_cards = _load_cg_card_db()
     cg_atks = _load_cg_attack_db()
 
-    files = sorted(
-        [p for p in Path(replay_dir).glob("*.json") if p.stem.isdigit()],
-        key=lambda p: int(p.stem),
-    )[:max_files]
+    if replay_files is not None:
+        files = [Path(p) for p in replay_files][:max_files]
+    elif replay_dir is not None:
+        files = sorted(
+            [p for p in Path(replay_dir).glob("*.json") if p.stem.isdigit()],
+            key=lambda p: int(p.stem),
+        )[:max_files]
+    else:
+        files = []
 
     card_hps: dict[int, list[int]] = {}
     card_types: dict[int, Counter[int]] = {}

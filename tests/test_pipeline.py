@@ -33,6 +33,10 @@ from src.dataset import (
 )
 from src.evaluate import evaluate_cross_deck_matrix, make_random_baseline_agent, play_single_match
 from src.features import (
+    FALLBACK_ATTACK_DB,
+    FALLBACK_CARD_DB,
+    FallbackAttackMeta,
+    FallbackCardMeta,
     LEGACY_OPT_DIM,
     LEGACY_STATE_DIM,
     MAX_ATTACK_ID,
@@ -45,6 +49,7 @@ from src.features import (
     get_attack_db,
     get_card_db,
     infer_fallback_metadata_from_replays,
+    register_fallback_metadata,
     validate_no_leakage,
 )
 from src.model import PTCGPolicyNet
@@ -203,6 +208,20 @@ def test_fallback_metadata_table_and_inference() -> None:
 
     inf_c, inf_a = infer_fallback_metadata_from_replays("data/replays", max_files=10)
     assert isinstance(inf_c, dict) and isinstance(inf_a, dict)
+
+    # Curated entries must not be overwritten by train-time inference registration
+    register_fallback_metadata(
+        cards={1406: FallbackCardMeta(cardId=1406, hp=999, stage=1)},
+        attacks={1748: FallbackAttackMeta(attackId=1748, damage=999)},
+    )
+    assert get_card_db()[1406].hp == FALLBACK_CARD_DB[1406].hp == 340
+    assert get_attack_db()[1748].damage == FALLBACK_ATTACK_DB[1748].damage == 200
+
+    inf_meta_path = Path("data/processed/inferred_metadata.json")
+    if inf_meta_path.exists():
+        with open(inf_meta_path, encoding="utf-8") as f:
+            inf_meta = json.load(f)
+        assert inf_meta.get("source_split") == "train"
 
 
 def test_action_decoding_single_and_multiselect() -> None:

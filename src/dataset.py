@@ -434,35 +434,6 @@ def preprocess_replays(
         if lp.exists():
             lp.unlink()
 
-    if infer_metadata:
-        inf_cards, inf_atks = infer_fallback_metadata_from_replays(replay_path)
-        register_fallback_metadata(inf_cards, inf_atks)
-        meta_dump = {
-            "cards": {
-                str(k): {
-                    "cardId": v.cardId,
-                    "cardType": v.cardType,
-                    "hp": v.hp,
-                    "ex": v.ex,
-                    "basic": v.basic,
-                    "stage": v.stage,
-                    "attacks": list(v.attacks),
-                    "skills": list(v.skills),
-                }
-                for k, v in inf_cards.items()
-            },
-            "attacks": {
-                str(k): {
-                    "attackId": v.attackId,
-                    "damage": v.damage,
-                    "energies": list(v.energies),
-                }
-                for k, v in inf_atks.items()
-            },
-        }
-        with open(out_path / "inferred_metadata.json", "w", encoding="utf-8") as f:
-            json.dump(meta_dump, f, indent=2)
-
     files = sorted(
         [p for p in replay_path.glob("*.json") if p.stem.isdigit()],
         key=lambda p: int(p.stem),
@@ -494,6 +465,45 @@ def preprocess_replays(
     assert train_ids.isdisjoint(val_ids)
     assert train_ids.isdisjoint(test_ids)
     assert val_ids.isdisjoint(test_ids)
+
+    # Infer fallback metadata strictly from train split files (never val/test)
+    # and never overwrite curated static FALLBACK_CARD_DB / FALLBACK_ATTACK_DB entries.
+    if infer_metadata:
+        inf_cards, inf_atks = infer_fallback_metadata_from_replays(
+            replay_files=split_files["train"],
+            max_files=len(split_files["train"]),
+        )
+        register_fallback_metadata(inf_cards, inf_atks, overwrite_curated=False)
+        from src.features import FALLBACK_ATTACK_DB, FALLBACK_CARD_DB
+        unseen_cards = {k: v for k, v in inf_cards.items() if k not in FALLBACK_CARD_DB}
+        unseen_atks = {k: v for k, v in inf_atks.items() if k not in FALLBACK_ATTACK_DB}
+        meta_dump = {
+            "source_split": "train",
+            "num_train_episodes_scanned": len(split_files["train"]),
+            "cards": {
+                str(k): {
+                    "cardId": v.cardId,
+                    "cardType": v.cardType,
+                    "hp": v.hp,
+                    "ex": v.ex,
+                    "basic": v.basic,
+                    "stage": v.stage,
+                    "attacks": list(v.attacks),
+                    "skills": list(v.skills),
+                }
+                for k, v in unseen_cards.items()
+            },
+            "attacks": {
+                str(k): {
+                    "attackId": v.attackId,
+                    "damage": v.damage,
+                    "energies": list(v.energies),
+                }
+                for k, v in unseen_atks.items()
+            },
+        }
+        with open(out_path / "inferred_metadata.json", "w", encoding="utf-8") as f:
+            json.dump(meta_dump, f, indent=2)
 
     overall_counts: Counter[str] = Counter()
     split_stats: dict[str, dict[str, int]] = {}
