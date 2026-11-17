@@ -163,3 +163,34 @@
    - Tái chạy `evaluate_packed_split` độc lập trên `val.pt` (`3,001` mẫu) và `test.pt` (`2,452` mẫu) khớp **100%** (`diffs_vs_json = {}`) với `eval_results.json` và toàn bộ bảng số liệu trong `REPORT_PHASE1_2.md` (`Val`: `exact_all=56.95% (1,709/3,001)`, `nontrivial=54.54% (1,550/2,842)`, `single=56.91% (1,627/2,859)`, `multi=57.75% (82/142)`, `jaccard=67.37%`, `zero=57.14% (20/35)`, `turn0=91.30% (63/69)`, `main=56.14% (1,646/2,932)`; `Test`: `exact_all=55.06% (1,350/2,452)`, `nontrivial=52.40% (1,213/2,315)`, `single=55.47% (1,283/2,313)`, `multi=48.20% (67/139)`, `jaccard=60.38%`, `zero=64.29% (9/14)`, `turn0=88.33% (53/60)`, `main=54.22% (1,297/2,392)`).
    - Tổng `by_deck` và `as_seat0_wdl + as_seat1_wdl` khớp tuyệt đối với `wins-draws-losses` trong `eval_results.json` và `REPORT_PHASE1_2.md` (`35-0-7` = `83.33%` vs `cabt_random_baseline`; `33-0-9` = `78.57%` vs `heuristic_baseline`; `0` invalid/errors/timeouts).
 
+
+---
+
+## Phase 3 Verification & Regression Review (Commits `c410ec8` / `7b52548`)
+
+- **Kết luận tổng quát**: **100% PASS (0 bugs / 0 hồi quy sau vòng sửa lỗi)**
+- **Worktree kiểm chứng**: `C:\Users\Admin\.gemini\antigravity-cli\worktrees\5a478e0f-eda6-4c5b-9082-f62139c71f53\swarm-worker-a85e1e68`
+- **Branch & Commit**: `phase3` — code commit `c410ec83ece379f99f8fa5c3d718c779538bf3b2`, doc-sync HEAD `7b52548`
+- **Vòng phát hiện & khắc phục trước đó (`bcb45e4` -> `c410ec8` / `7b52548`)**:
+  1. Phát hiện `preprocess_replays` quét toàn bộ thư mục replay trước khi chia `train/val/test` và ghi đè `FALLBACK_CARD_DB`/`FALLBACK_ATTACK_DB` trong RAM (`1406: stage=1`, `1748: damage=330`) mà tiến trình `evaluate`/`agent.py` không nạp lại (`1406: stage=2`, `1748: damage=200`). Đã sửa triệt để ở `c410ec8`: tách `split_files` trước, chỉ suy diễn trên `split_files["train"]`, đặt `overwrite_curated=False`, và nạp `inferred_metadata.json` khi đánh giá.
+  2. Phát hiện `eval_results.json` ghi `git_commit` của `main` (`b993aa5`) và `REPORT_PHASE3.md` ghi nhầm `Epoch 19` cho `eval_bc_results.json` cùng khoảng thời gian/tốc độ epoch. Đã chạy lại toàn bộ pipeline (`preprocess -> BC 20+2 -> train-rl 10+2 -> evaluate`) trên `c410ec8` và đồng bộ 100% tài liệu ở `7b52548`.
+
+### Bằng chứng kiểm chứng độc lập (trên `7b52548` / `c410ec8`)
+
+1. **Zero Leakage & Sharded Storage (`data/processed/`)**:
+   - Đã kiểm tra toàn bộ `209` episodes (`93,829` frames, `90,609` kept decisions): `opp_hand_leak = 0`, `opp_prize_nonempty_ids = 0`, `win_anomalies = 0`.
+   - `episode_id` tách rời **100%** giữa `train` (`146` eps, `61,890` mẫu / `5` shards), `val` (`31` eps, `13,970` mẫu / `1` shard), và `test` (`32` eps, `14,749` mẫu / `1` shard); `inferred_metadata.json` ghi nhận `source_split == "train"`, `num_train_episodes_scanned == 146`.
+2. **Pytest & Smoke Test**:
+   - `python -m pytest -p no:cacheprovider -v tests/test_pipeline.py`: **`15/15 PASSED` (`18.97s`)**.
+   - `python -m src.cli smoke-test --deck deck.csv --checkpoint checkpoints/best_model.pt --seed 42`: Random vs Random (`166` steps, `0/0` faults); Checkpoint vs Random (`111` steps, `13` turns, `winner=0`, `decks_equal=true`, `invalid_actions=[0, 0]`, `runtime_errors=[0, 0]`, `1.8277 ms/decision`).
+3. **Đánh giá độc lập `checkpoints/best_model.pt` (BC Ep 22 + RL Upd 5)**:
+   - **Offline Test (`14,749` mẫu)** khớp 100% với `checkpoints/eval_results.json`: `loss = 1.2271`, `exact_match_all = 61.53% (9,075/14,749)`, `exact_match_nontrivial = 59.70% (8,406/14,080)`, `single_select_acc = 61.65% (8,489/13,770)`, `multi_select_exact_acc = 59.86% (586/979)`, `multi_select_jaccard = 72.87%`, `zero_select_acc = 68.81% (75/109)`, `turn0_setup_acc = 90.99% (323/355)`, `invalid_actions = 0`.
+   - **Simulator Live Check độc lập** (`invalid_actions = 0`, `runtime_errors = 0`, `timeouts = 0`):
+     - Mirror vs `cabt_random_baseline` (`42` trận): **`41-0-1 (97.62%)`** (báo cáo trong `eval_results.json`: `39-0-3 / 92.86%`).
+     - Mirror vs `heuristic_baseline` (`42` trận): **`37-0-5 (88.10%)`** (khớp `37-0-5 / 88.10%` trong `eval_results.json`).
+     - Cross-Deck Matrix vs `heuristic_baseline` (`54` trận): **`43-0-11 (79.63%)`** (`eval_results.json`: `50-0-4 / 92.59%`; sai khác do RNG xáo bài nội bộ C++ của `cg.game`).
+     - CPU Latency thực đo: mirror `mean = 2.0233 ms`, `p99 = 3.5264 ms`; cross-deck `mean = 2.1908 ms`, `p99 = 4.0867 ms` (tương đồng với `1.9230 ms` / `3.1413 ms` trong `eval_results.json`).
+4. **Cấu hình & Git Hygiene**:
+   - `AGENTS.md` cập nhật đúng quy tắc model cho `@worker` (`gemini-4-hydrogen-high`), `@reviewer` (`gemini-4-hydrogen-high`), và `@monitor` (`gemini-4-argon-high`).
+   - `.gitignore` giữ `data/`, `checkpoints/`, `cg/*.dll`, `cg/*.so` ở trạng thái untracked/ignored (`git status --ignored -s` xác nhận).
+   - Toàn bộ số liệu trong `REPORT_PHASE3.md`, `README.md`, và `HANDOFF.md` khớp 100% với `dataset_stats.json`, `train_summary.json`, `rl_summary.json`, `eval_bc_results.json`, và `eval_results.json`.
