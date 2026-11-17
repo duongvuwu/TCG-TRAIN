@@ -1,4 +1,4 @@
-"""Feature extraction for CABT Pokémon TCG observations and legal options.
+"""Feature extraction and static fallback metadata for CABT Pokémon TCG observations.
 
 Strictly uses only information visible to the deciding player (`yourIndex`) at
 the decision timestamp. Never accesses opponent hidden hand cards, future steps,
@@ -6,19 +6,113 @@ or internal simulator state (`search_begin_input`).
 """
 from __future__ import annotations
 
+import json
+from collections import Counter
+from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-STATE_DIM = 64
-OPT_DIM = 48
+STATE_DIM = 112
+OPT_DIM = 64
+LEGACY_STATE_DIM = 64
+LEGACY_OPT_DIM = 48
 MAX_HAND_CARDS = 16
 NUM_BOARD_SLOTS = 12  # [my_active, my_bench_0..4, opp_active, opp_bench_0..4]
 MAX_CARD_ID = 2048
 MAX_ATTACK_ID = 2048
 MAX_SELECT_CTX = 64
 MAX_SELECT_TYPE = 16
+
+
+@dataclass(frozen=True)
+class FallbackCardMeta:
+    """Lightweight card metadata mirroring `cg.api.CardData` for post-1267 cards."""
+
+    cardId: int
+    cardType: int = 0
+    hp: int = 0
+    ex: bool = False
+    basic: bool = True
+    stage: int = 0
+    energyType: int = 0
+    weakness: int | None = None
+    attacks: tuple[int, ...] = ()
+    skills: tuple[int, ...] = ()
+    evolvesFrom: str | None = None
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class FallbackAttackMeta:
+    """Lightweight attack metadata mirroring `cg.api.Attack` for post-1556 attacks."""
+
+    attackId: int
+    damage: int = 0
+    energies: tuple[int, ...] = ()
+    name: str = ""
+
+
+# Static fallback metadata table inferred from 2026-11-13-v1 replays for IDs
+# outside legacy `cg/cg.dll` (`cardId > 1267`, `attackId > 1556`).
+FALLBACK_CARD_DB: dict[int, FallbackCardMeta] = {
+    1331: FallbackCardMeta(
+        cardId=1331,
+        cardType=0,
+        hp=180,
+        ex=False,
+        basic=False,
+        stage=2,
+        energyType=0,
+        attacks=(1641, 1642),
+        name="FallbackPokemon_1331",
+    ),
+    1387: FallbackCardMeta(
+        cardId=1387,
+        cardType=0,
+        hp=70,
+        ex=False,
+        basic=True,
+        stage=0,
+        energyType=0,
+        attacks=(1715, 1716),
+        name="FallbackPokemon_1387",
+    ),
+    1406: FallbackCardMeta(
+        cardId=1406,
+        cardType=0,
+        hp=340,
+        ex=True,
+        basic=False,
+        stage=2,
+        energyType=0,
+        attacks=(1747, 1748),
+        name="FallbackPokemonEx_1406",
+    ),
+    1413: FallbackCardMeta(
+        cardId=1413,
+        cardType=1,
+        hp=0,
+        ex=False,
+        basic=False,
+        stage=0,
+        name="FallbackTrainer_1413",
+    ),
+}
+
+FALLBACK_ATTACK_DB: dict[int, FallbackAttackMeta] = {
+    1641: FallbackAttackMeta(attackId=1641, damage=60, energies=(0,), name="FallbackAttack_1641"),
+    1642: FallbackAttackMeta(attackId=1642, damage=300, energies=(0, 0, 0, 0), name="FallbackAttack_1642"),
+    1715: FallbackAttackMeta(attackId=1715, damage=0, energies=(0,), name="FallbackAttack_1715"),
+    1716: FallbackAttackMeta(attackId=1716, damage=50, energies=(0, 0, 0), name="FallbackAttack_1716"),
+    1747: FallbackAttackMeta(attackId=1747, damage=90, energies=(0, 0), name="FallbackAttack_1747"),
+    1748: FallbackAttackMeta(attackId=1748, damage=200, energies=(0, 0, 0), name="FallbackAttack_1748"),
+}
+
+_RUNTIME_CARD_OVERRIDES: dict[int, FallbackCardMeta] = {}
+_RUNTIME_ATTACK_OVERRIDES: dict[int, FallbackAttackMeta] = {}
 
 
 def int_or(d: dict[str, Any], key: str, default: int) -> int:
@@ -28,23 +122,238 @@ def int_or(d: dict[str, Any], key: str, default: int) -> int:
 
 
 @lru_cache(maxsize=1)
-def get_card_db() -> dict[int, Any]:
-    """Load card metadata dictionary {cardId: CardData} from cg.api."""
+def _load_cg_card_db() -> dict[int, Any]:
     try:
         import cg.api
+
         return {int(c.cardId): c for c in cg.api.all_card_data()}
     except Exception:
         return {}
 
 
 @lru_cache(maxsize=1)
-def get_attack_db() -> dict[int, Any]:
-    """Load attack metadata dictionary {attackId: Attack} from cg.api."""
+def _load_cg_attack_db() -> dict[int, Any]:
     try:
         import cg.api
+
         return {int(a.attackId): a for a in cg.api.all_attack()}
     except Exception:
         return {}
+
+
+@lru_cache(maxsize=1)
+def get_card_db() -> dict[int, Any]:
+    """Load card metadata dictionary `{cardId: CardData}` merged with fallback metadata."""
+    merged: dict[int, Any] = dict(FALLBACK_CARD_DB)
+    merged.update(_RUNTIME_CARD_OVERRIDES)
+    merged.update(_load_cg_card_db())
+    return merged
+
+
+@lru_cache(maxsize=1)
+def get_attack_db() -> dict[int, Any]:
+    """Load attack metadata dictionary `{attackId: Attack}` merged with fallback metadata."""
+    merged: dict[int, Any] = dict(FALLBACK_ATTACK_DB)
+    merged.update(_RUNTIME_ATTACK_OVERRIDES)
+    merged.update(_load_cg_attack_db())
+    return merged
+
+
+def register_fallback_metadata(
+    cards: dict[int, FallbackCardMeta] | None = None,
+    attacks: dict[int, FallbackAttackMeta] | None = None,
+) -> None:
+    """Register additional fallback metadata entries and invalidate cached lookups."""
+    if cards:
+        _RUNTIME_CARD_OVERRIDES.update(cards)
+    if attacks:
+        _RUNTIME_ATTACK_OVERRIDES.update(attacks)
+    get_card_db.cache_clear()
+    get_attack_db.cache_clear()
+
+
+def infer_fallback_metadata_from_replays(
+    replay_dir: str | Path,
+    max_files: int = 300,
+) -> tuple[dict[int, FallbackCardMeta], dict[int, FallbackAttackMeta]]:
+    """Infer card and attack metadata for IDs absent from legacy `cg.api` using replay logs."""
+    cg_cards = _load_cg_card_db()
+    cg_atks = _load_cg_attack_db()
+
+    files = sorted(
+        [p for p in Path(replay_dir).glob("*.json") if p.stem.isdigit()],
+        key=lambda p: int(p.stem),
+    )[:max_files]
+
+    card_hps: dict[int, list[int]] = {}
+    card_types: dict[int, Counter[int]] = {}
+    card_pre_evo_max: dict[int, int] = {}
+    card_etypes: dict[int, Counter[int]] = {}
+    card_atks: dict[int, set[int]] = {}
+    card_has_skill: set[int] = set()
+
+    atk_dmgs: dict[int, list[int]] = {}
+    atk_min_cost: dict[int, int] = {}
+
+    for fp in files:
+        try:
+            with open(fp, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            continue
+
+        for st in raw.get("steps") or []:
+            for seat_obj in st:
+                obs = seat_obj.get("observation") or {}
+                cur = obs.get("current") or {}
+                players = cur.get("players") or []
+                for pl in players:
+                    if not isinstance(pl, dict):
+                        continue
+                    for area_key in ("active", "bench"):
+                        for p in pl.get(area_key) or []:
+                            if not isinstance(p, dict):
+                                continue
+                            cid = p.get("id")
+                            if not isinstance(cid, int) or cid <= 0 or cid in cg_cards:
+                                continue
+                            card_types.setdefault(cid, Counter())[0] += 1
+                            mhp = int_or(p, "maxHp", 0)
+                            if mhp > 0:
+                                card_hps.setdefault(cid, []).append(mhp)
+                            pre = p.get("preEvolution") or p.get("preEvolutions") or []
+                            card_pre_evo_max[cid] = max(card_pre_evo_max.get(cid, 0), len(pre))
+
+                sel = obs.get("select") or {}
+                me = cur.get("yourIndex", 0)
+                my_act = None
+                if isinstance(me, int) and 0 <= me < len(players) and isinstance(players[me], dict):
+                    act_l = players[me].get("active") or []
+                    if act_l and isinstance(act_l[0], dict):
+                        my_act = act_l[0]
+
+                for o in sel.get("option") or []:
+                    if not isinstance(o, dict):
+                        continue
+                    otype = int_or(o, "type", -1)
+                    aid = o.get("attackId")
+                    if isinstance(aid, int) and aid > 0 and aid not in cg_atks and my_act is not None:
+                        src_cid = my_act.get("id")
+                        if isinstance(src_cid, int) and src_cid > 0 and src_cid not in cg_cards:
+                            card_atks.setdefault(src_cid, set()).add(aid)
+                        en_cnt = len(my_act.get("energies") or [])
+                        if en_cnt >= 0:
+                            prev = atk_min_cost.get(aid)
+                            atk_min_cost[aid] = en_cnt if prev is None else min(prev, en_cnt)
+                    if otype == 10:  # ABILITY
+                        area = o.get("area")
+                        idx = o.get("index")
+                        if isinstance(me, int) and 0 <= me < len(players) and isinstance(idx, int) and idx >= 0:
+                            arr = players[me].get("active" if area == 4 else "bench" if area == 5 else "")
+                            if isinstance(arr, list) and idx < len(arr) and isinstance(arr[idx], dict):
+                                scid = arr[idx].get("id")
+                                if isinstance(scid, int) and scid > 0 and scid not in cg_cards:
+                                    card_has_skill.add(scid)
+                    elif otype == 8:  # ATTACH (energy=5/6 or tool=2)
+                        area = o.get("area")
+                        idx = o.get("index")
+                        if area == 2 and isinstance(me, int) and 0 <= me < len(players) and isinstance(idx, int):
+                            hand = players[me].get("hand") or []
+                            if 0 <= idx < len(hand) and isinstance(hand[idx], dict):
+                                scid = hand[idx].get("id")
+                                if isinstance(scid, int) and scid > 0 and scid not in cg_cards:
+                                    card_types.setdefault(scid, Counter())[5] += 1
+                    elif otype == 9:  # EVOLVE
+                        area = o.get("area")
+                        idx = o.get("index")
+                        if area == 2 and isinstance(me, int) and 0 <= me < len(players) and isinstance(idx, int):
+                            hand = players[me].get("hand") or []
+                            if 0 <= idx < len(hand) and isinstance(hand[idx], dict):
+                                scid = hand[idx].get("id")
+                                if isinstance(scid, int) and scid > 0 and scid not in cg_cards:
+                                    card_types.setdefault(scid, Counter())[0] += 1
+                                    card_pre_evo_max[scid] = max(card_pre_evo_max.get(scid, 1), 1)
+                    elif otype == 7:  # PLAY from hand (Trainer/Item/Supporter/Stadium/Basic)
+                        idx = o.get("index")
+                        if isinstance(me, int) and 0 <= me < len(players) and isinstance(idx, int):
+                            hand = players[me].get("hand") or []
+                            if 0 <= idx < len(hand) and isinstance(hand[idx], dict):
+                                scid = hand[idx].get("id")
+                                if isinstance(scid, int) and scid > 0 and scid not in cg_cards:
+                                    # Only assign Trainer (1) if not seen on field as Pokemon
+                                    card_types.setdefault(scid, Counter())[1] += 1
+
+                logs = obs.get("logs") or []
+                for i, lg in enumerate(logs):
+                    if not isinstance(lg, dict):
+                        continue
+                    ltype = lg.get("type")
+                    if ltype == 15:  # ATTACK
+                        aid = lg.get("attackId")
+                        scid = lg.get("cardId")
+                        if isinstance(aid, int) and aid > 0 and aid not in cg_atks:
+                            if isinstance(scid, int) and scid > 0 and scid not in cg_cards:
+                                card_atks.setdefault(scid, set()).add(aid)
+                            max_hit = 0
+                            for j in range(i + 1, min(i + 6, len(logs))):
+                                nxt = logs[j]
+                                if nxt.get("type") in (15, 2, 3):
+                                    break
+                                if nxt.get("type") == 16 and not nxt.get("putDamageCounter"):
+                                    val = int(nxt.get("value", 0) or 0)
+                                    if val < 0:
+                                        max_hit = max(max_hit, -val)
+                            if max_hit > 0:
+                                atk_dmgs.setdefault(aid, []).append(max_hit)
+                    elif ltype == 11:  # ATTACH
+                        scid = lg.get("cardId")
+                        if isinstance(scid, int) and scid > 0 and scid not in cg_cards:
+                            card_types.setdefault(scid, Counter())[5] += 1
+
+    inferred_attacks: dict[int, FallbackAttackMeta] = {}
+    all_aids = set(atk_dmgs.keys()) | set(atk_min_cost.keys())
+    for aid in sorted(all_aids):
+        dmgs = atk_dmgs.get(aid, [])
+        dmg = int(max(dmgs)) if dmgs else 0
+        # Weaknesses double damage; if median vs max is exact 2x, pick mode/median
+        if len(dmgs) >= 3:
+            cnt = Counter(dmgs)
+            dmg = int(cnt.most_common(1)[0][0])
+        cost = max(0, int(atk_min_cost.get(aid, 1)))
+        inferred_attacks[aid] = FallbackAttackMeta(
+            attackId=aid,
+            damage=dmg,
+            energies=tuple([0] * cost),
+            name=f"FallbackAttack_{aid}",
+        )
+
+    inferred_cards: dict[int, FallbackCardMeta] = {}
+    all_cids = set(card_types.keys()) | set(card_hps.keys()) | set(card_atks.keys())
+    for cid in sorted(all_cids):
+        tcounts = card_types.get(cid, Counter())
+        if cid in card_hps or cid in card_atks or tcounts.get(0, 0) > 0:
+            ctype = 0
+        elif tcounts.get(5, 0) > 0:
+            ctype = 5
+        else:
+            ctype = tcounts.most_common(1)[0][0] if tcounts else 1
+        hps = card_hps.get(cid, [])
+        hp_val = int(Counter(hps).most_common(1)[0][0]) if hps else 0
+        stage_val = card_pre_evo_max.get(cid, 0)
+        inferred_cards[cid] = FallbackCardMeta(
+            cardId=cid,
+            cardType=ctype,
+            hp=hp_val,
+            ex=(ctype == 0 and hp_val >= 210),
+            basic=(ctype == 0 and stage_val == 0),
+            stage=stage_val,
+            energyType=0,
+            attacks=tuple(sorted(card_atks.get(cid, set()))),
+            skills=(1,) if cid in card_has_skill else (),
+            name=f"FallbackCard_{cid}",
+        )
+
+    return inferred_cards, inferred_attacks
 
 
 def _clamp_card_id(cid: int | None) -> int:
@@ -81,6 +390,22 @@ def validate_no_leakage(obs: dict[str, Any], expected_seat: int | None = None) -
         raise ValueError("Invalid self state: active player's own hand is None!")
 
 
+def _pokemon_stage_norm(p: dict[str, Any] | None, cmeta: Any) -> float:
+    if isinstance(p, dict):
+        pre = p.get("preEvolution") or p.get("preEvolutions") or []
+        if isinstance(pre, list) and len(pre) > 0:
+            return min(len(pre) * 0.5, 1.0)
+    if cmeta is not None:
+        st = getattr(cmeta, "stage", None)
+        if isinstance(st, int) and st > 0:
+            return min(st * 0.5, 1.0)
+        if getattr(cmeta, "evolvesFrom", None):
+            return 0.5
+        if getattr(cmeta, "basic", True) is False:
+            return 0.5
+    return 0.0
+
+
 def _pokemon_summary(p: dict[str, Any] | None, card_db: dict[int, Any]) -> tuple[float, float, float, float, float, float, float, int]:
     """Return (present, hp_norm, max_hp_norm, dmg_ratio, n_energy, n_tools, is_ex, card_id)."""
     if not p or not isinstance(p, dict):
@@ -103,6 +428,29 @@ def _pokemon_summary(p: dict[str, Any] | None, card_db: dict[int, Any]) -> tuple
         is_ex,
         cid,
     )
+
+
+def _discard_breakdown(discard_list: list[Any] | None, card_db: dict[int, Any]) -> tuple[int, int, int, Counter[int]]:
+    """Count (pokemon, energy, trainer, card_id_counts) in a public discard pile."""
+    n_poke = n_energy = n_trainer = 0
+    cid_counts: Counter[int] = Counter()
+    for dcard in discard_list or []:
+        if not isinstance(dcard, dict):
+            continue
+        cid = _clamp_card_id(dcard.get("id"))
+        if cid > 0:
+            cid_counts[cid] += 1
+        cmeta = card_db.get(cid)
+        if cmeta is None:
+            continue
+        ct = int(getattr(cmeta, "cardType", -1))
+        if ct == 0:
+            n_poke += 1
+        elif ct in (5, 6):
+            n_energy += 1
+        elif ct in (1, 2, 3, 4):
+            n_trainer += 1
+    return n_poke, n_energy, n_trainer, cid_counts
 
 
 def _resolve_card_from_area(
@@ -244,11 +592,14 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
     # Hand composition summary (only self hand is visible; includes CardType.STADIUM == 4)
     my_hand = p_me.get("hand") or []
     hand_cards = np.zeros(MAX_HAND_CARDS, dtype=np.int64)
+    hand_cid_counts: Counter[int] = Counter()
     n_poke = n_item_or_stad = n_supp = n_energy = n_basic_poke = 0
     for idx_h, hcard in enumerate(my_hand):
         if not isinstance(hcard, dict):
             continue
         cid = _clamp_card_id(hcard.get("id"))
+        if cid > 0:
+            hand_cid_counts[cid] += 1
         if idx_h < MAX_HAND_CARDS:
             hand_cards[idx_h] = cid
         cmeta = card_db.get(cid)
@@ -272,6 +623,80 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
     state_vec[61] = min(n_energy / 6.0, 1.5)
     state_vec[62] = 1.0 if (cur.get("stadium") and len(cur["stadium"]) > 0) else 0.0
     state_vec[63] = float(int_or(p_me, "win", 0)) - float(int_or(p_opp, "win", 0))
+
+    # --- Phase 3 Enriched State Features (64..111) ---
+    # 64..83: My bench per-slot (5 x 4): [hp_norm, dmg_ratio, n_energy_norm, stage_norm]
+    for bi in range(min(5, len(my_bench))):
+        bp = my_bench[bi]
+        if isinstance(bp, dict):
+            _, b_hp, _, b_dmg, b_en, _, _, b_cid = _pokemon_summary(bp, card_db)
+            b_stage = _pokemon_stage_norm(bp, card_db.get(b_cid))
+            base = 64 + bi * 4
+            state_vec[base] = b_hp
+            state_vec[base + 1] = b_dmg
+            state_vec[base + 2] = b_en
+            state_vec[base + 3] = b_stage
+
+    # 84..93: Opp bench per-slot (5 x 2): [hp_norm, n_energy_norm]
+    for bi in range(min(5, len(opp_bench))):
+        bp = opp_bench[bi]
+        if isinstance(bp, dict):
+            _, ob_hp, _, _, ob_en, _, _, _ = _pokemon_summary(bp, card_db)
+            base = 84 + bi * 2
+            state_vec[base] = ob_hp
+            state_vec[base + 1] = ob_en
+
+    # 94..95: Active evolution stage norms
+    state_vec[94] = _pokemon_stage_norm(my_act, card_db.get(ma_cid))
+    state_vec[95] = _pokemon_stage_norm(opp_act, card_db.get(oa_cid))
+
+    # 96..101: Public discard pile breakdown (pokemon, energy, trainer)
+    my_dp, my_de, my_dt, my_disc_counts = _discard_breakdown(p_me.get("discard"), card_db)
+    opp_dp, opp_de, opp_dt, _ = _discard_breakdown(p_opp.get("discard"), card_db)
+    state_vec[96] = min(my_dp / 15.0, 1.5)
+    state_vec[97] = min(my_de / 10.0, 1.5)
+    state_vec[98] = min(my_dt / 20.0, 1.5)
+    state_vec[99] = min(opp_dp / 15.0, 1.5)
+    state_vec[100] = min(opp_de / 10.0, 1.5)
+    state_vec[101] = min(opp_dt / 20.0, 1.5)
+
+    # 102..111: Causal short-term action history from `obs["logs"]` (strictly past/current logs)
+    logs = obs.get("logs") or []
+    state_vec[102] = min(len(logs) / 20.0, 2.0)
+    n_draws_me = 0
+    n_draws_opp = 0
+    dmg_taken_me = 0.0
+    dmg_dealt_opp = 0.0
+    for lg in logs:
+        if not isinstance(lg, dict):
+            continue
+        lt = lg.get("type")
+        lp = lg.get("playerIndex")
+        if lt == 10:  # PLAY
+            state_vec[103] = 1.0
+        elif lt == 11:  # ATTACH
+            state_vec[104] = 1.0
+        elif lt == 12:  # EVOLVE
+            state_vec[105] = 1.0
+        elif lt == 15:  # ATTACK
+            state_vec[106] = 1.0
+        elif lt == 8:  # SWITCH
+            state_vec[107] = 1.0
+        elif lt == 4 and lp == me:
+            n_draws_me += 1
+        elif lt in (4, 5) and lp == opp:
+            n_draws_opp += 1
+        elif lt == 16:  # HP_CHANGE
+            val = float(lg.get("value", 0) or 0)
+            if val < 0:
+                if lp == me:
+                    dmg_taken_me += -val
+                elif lp == opp:
+                    dmg_dealt_opp += -val
+    state_vec[108] = min(n_draws_me / 7.0, 1.5)
+    state_vec[109] = min(n_draws_opp / 7.0, 1.5)
+    state_vec[110] = min(dmg_taken_me / 300.0, 1.5)
+    state_vec[111] = min(dmg_dealt_opp / 300.0, 1.5)
 
     # Board slot card IDs: [my_active, my_bench_0..4, opp_active, opp_bench_0..4]
     board_cards = np.zeros(NUM_BOARD_SLOTS, dtype=np.int64)
@@ -298,13 +723,13 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
     my_act_etype = None
     if ma_cid in card_db:
         my_act_etype = getattr(card_db[ma_cid], "energyType", None)
+    my_act_en_cnt = len(my_act.get("energies") or []) if isinstance(my_act, dict) else 0
+
+    group_counts: Counter[tuple[int, int]] = Counter()
+    resolved_opts: list[tuple[int, int, dict[str, Any] | None, dict[str, Any] | None, int]] = []
 
     for i, o in enumerate(opts):
-        v = opt_feats[i]
         otype = int_or(o, "type", 0)
-        if 0 <= otype < 17:
-            v[otype] = 1.0
-
         area = o.get("area")
         in_play_area = o.get("inPlayArea")
         o_index = o.get("index")
@@ -312,24 +737,6 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
         p_idx = o.get("playerIndex")
         if p_idx is None:
             p_idx = me
-
-        # Area encoding (17..23): includes STADIUM (7) mapped with LOOKING (12) in slot 23
-        if area in (1, 2, 3, 4, 5, 6):
-            area_slot = {1: 17, 2: 18, 3: 19, 4: 20, 5: 21, 6: 22}[area]
-            v[area_slot] = 1.0
-        elif area in (7, 12):  # STADIUM (7) or LOOKING (12)
-            v[23] = 1.0
-
-        if in_play_area == 4:
-            v[24] = 1.0
-        elif in_play_area == 5:
-            v[25] = 1.0
-
-        v[26] = 1.0 if p_idx == me else 0.0
-        v[27] = 1.0 if p_idx == opp else 0.0
-        v[28] = min(float(int_or(o, "number", 0)) / 10.0, 2.0)
-        v[29] = min(float(int_or(o, "count", 0)) / 5.0, 2.0)
-        v[30] = float(i) / max(n_opts - 1, 1)
 
         src_cid = 0
         tgt_cid = 0
@@ -370,6 +777,41 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
         elif otype == 15:  # SKILL
             src_cid = _clamp_card_id(o.get("cardId"))
 
+        group_counts[(otype, src_cid)] += 1
+        resolved_opts.append((src_cid, tgt_cid, src_poke, tgt_poke, aid))
+
+    for i, o in enumerate(opts):
+        v = opt_feats[i]
+        otype = int_or(o, "type", 0)
+        if 0 <= otype < 17:
+            v[otype] = 1.0
+
+        area = o.get("area")
+        in_play_area = o.get("inPlayArea")
+        p_idx = o.get("playerIndex")
+        if p_idx is None:
+            p_idx = me
+
+        # Area encoding (17..23): includes STADIUM (7) mapped with LOOKING (12) in slot 23
+        if area in (1, 2, 3, 4, 5, 6):
+            area_slot = {1: 17, 2: 18, 3: 19, 4: 20, 5: 21, 6: 22}[area]
+            v[area_slot] = 1.0
+        elif area in (7, 12):  # STADIUM (7) or LOOKING (12)
+            v[23] = 1.0
+
+        if in_play_area == 4:
+            v[24] = 1.0
+        elif in_play_area == 5:
+            v[25] = 1.0
+
+        v[26] = 1.0 if p_idx == me else 0.0
+        v[27] = 1.0 if p_idx == opp else 0.0
+        v[28] = min(float(int_or(o, "number", 0)) / 10.0, 2.0)
+        v[29] = min(float(int_or(o, "count", 0)) / 5.0, 2.0)
+        v[30] = float(i) / max(n_opts - 1, 1)
+
+        src_cid, tgt_cid, src_poke, tgt_poke, aid = resolved_opts[i]
+
         opt_card_ids[i] = src_cid
         opt_target_card_ids[i] = tgt_cid
         opt_attack_ids[i] = aid
@@ -384,7 +826,6 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
             v[39] = 1.0 if getattr(cmeta, "ex", False) else 0.0
             v[40] = 1.0 if (getattr(cmeta, "skills", None) and len(cmeta.skills) > 0) else 0.0
         elif isinstance(src_poke, dict):
-            # Fallback metadata when cardId > 1267 is in play on the board
             v[31] = 1.0  # POKEMON
             hp_p = float(int_or(src_poke, "maxHp", 0))
             v[38] = min(hp_p / 340.0, 1.5)
@@ -392,14 +833,19 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
             v[40] = 1.0 if otype == 10 else 0.0
 
         # Target Pokémon state features (41..44)
+        tgt_en_cnt = 0
         if isinstance(tgt_poke, dict):
-            _, thp, tmhp, tdmg, ten, _, _, _ = _pokemon_summary(tgt_poke, card_db)
+            _, thp, _, tdmg, ten, _, tex, _ = _pokemon_summary(tgt_poke, card_db)
             v[41] = thp
             v[42] = tdmg
             v[43] = ten
             v[44] = 1.0 if tgt_poke.get("appearThisTurn") else 0.0
+            tgt_en_cnt = len(tgt_poke.get("energies") or [])
+            v[63] = tex
 
         # Attack features (45..47)
+        eff_dmg = 0.0
+        atk_cost = 0
         if aid > 0 and aid in atk_db:
             ameta = atk_db[aid]
             dmg = float(getattr(ameta, "damage", 0) or 0)
@@ -407,13 +853,57 @@ def extract_decision_features(obs: dict[str, Any]) -> dict[str, Any]:
                 eff_dmg = dmg * 2.0
             else:
                 eff_dmg = dmg
+            atk_cost = len(getattr(ameta, "energies", []) or [])
             v[45] = min(eff_dmg / 300.0, 2.0)
-            v[46] = min(len(getattr(ameta, "energies", []) or []) / 5.0, 1.5)
+            v[46] = min(float(atk_cost) / 5.0, 1.5)
             v[47] = 1.0 if (opp_act_hp > 0 and eff_dmg >= opp_act_hp) else 0.0
         elif otype == 13 and aid > 0:
-            # Fallback for newer attackId > 1556
+            eff_dmg = 150.0
+            atk_cost = 2
             v[45] = 0.5
             v[46] = 0.4
+
+        # --- Phase 3 Enriched Option Features (48..63) ---
+        tmeta = card_db.get(tgt_cid)
+        v[48] = _pokemon_stage_norm(src_poke, cmeta)
+        v[49] = _pokemon_stage_norm(tgt_poke, tmeta)
+        v[50] = 1.0 if (in_play_area == 4 or area == 4 or otype == 13) else 0.0
+        v[51] = 1.0 if (in_play_area == 5 or area == 5) else 0.0
+
+        src_is_energy = bool(
+            (cmeta is not None and int(getattr(cmeta, "cardType", -1)) in (5, 6)) or otype in (5, 6)
+        )
+        v[52] = 1.0 if src_is_energy else 0.0
+
+        if tmeta is not None and int(getattr(tmeta, "cardType", -1)) == 0:
+            max_tgt_cost = 0
+            needed_etypes: set[int] = set()
+            for taid in getattr(tmeta, "attacks", ()) or ():
+                tameta = atk_db.get(int(taid))
+                if tameta is None:
+                    continue
+                reqs = list(getattr(tameta, "energies", ()) or ())
+                max_tgt_cost = max(max_tgt_cost, len(reqs))
+                for r in reqs:
+                    needed_etypes.add(int(r))
+            if src_is_energy and cmeta is not None:
+                src_et = int(getattr(cmeta, "energyType", 0) or 0)
+                if src_et in needed_etypes or 0 in needed_etypes or src_et == 10:
+                    v[53] = 1.0
+            if isinstance(tgt_poke, dict) and max_tgt_cost > 0:
+                deficit = max(0, max_tgt_cost - tgt_en_cnt)
+                v[54] = min(deficit / 4.0, 1.0)
+
+        if otype == 13:
+            v[55] = min(eff_dmg / max(opp_act_hp, 1.0), 2.0) if opp_act_hp > 0 else 0.0
+            v[56] = min(float(my_act_en_cnt) / max(float(atk_cost), 1.0), 2.0)
+
+        v[57] = 1.0 if max_c > 1 else 0.0
+        v[58] = float(min_c) / max(n_opts, 1)
+        v[59] = float(max_c) / max(n_opts, 1)
+        v[60] = min(hand_cid_counts.get(src_cid, 0) / 4.0, 1.0) if src_cid > 0 else 0.0
+        v[61] = min(my_disc_counts.get(src_cid, 0) / 4.0, 1.0) if src_cid > 0 else 0.0
+        v[62] = float(group_counts.get((otype, src_cid), 1)) / max(n_opts, 1)
 
     return {
         "state_vec": state_vec,

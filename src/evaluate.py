@@ -1,4 +1,4 @@
-"""Offline test evaluation and live CABT simulator battle evaluation."""
+"""Offline test evaluation and live CABT simulator battle evaluation (mirror + cross-deck matrix)."""
 from __future__ import annotations
 
 import json
@@ -7,9 +7,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import torch
 
 from src import DATASET_REF, DATASET_VERSION
+from src.dataset import get_split_shard_paths
 from src.features import get_attack_db, int_or
 from src.train import (
     evaluate_packed_split,
@@ -115,12 +117,7 @@ def play_single_match(
     deck1: list[int] | None = None,
     max_steps: int = 3000,
 ) -> dict[str, Any]:
-    """Run one complete match in the CABT simulator (`cg.game`) and record stats.
-
-    Fixes BUG-1: When `deck0` and `deck1` are explicitly provided, they are used
-    directly for `battle_start(deck0, deck1)` (never overwritten by `agents[s](init_obs)`),
-    while `agents[s](init_obs)` is still verified for valid 60-card deck format.
-    """
+    """Run one complete match in the CABT simulator (`cg.game`) and record stats & latencies."""
     import cg.game
 
     agents = [agent0, agent1]
@@ -146,7 +143,7 @@ def play_single_match(
             invalid_actions[s] += 1
 
         if explicit_decks[s] is not None:
-            decks[s] = explicit_decks[s]  # Preserve requested mirror-match deck
+            decks[s] = explicit_decks[s]
         elif valid_init_dk:
             decks[s] = list(dk)
         else:
@@ -165,12 +162,16 @@ def play_single_match(
                 invalid_actions[1] + (1 if start_data.errorPlayer == 1 else 0),
             ],
             "runtime_errors": runtime_errors,
+            "decision_counts": [0, 0],
+            "decision_latencies_ms": [[], []],
+            "avg_latency_ms": [0.0, 0.0],
             "error": f"battle_start failed: player={start_data.errorPlayer}, type={start_data.errorType}",
         }
 
     steps = 0
     decision_counts = [0, 0]
     decision_time_ms = [0.0, 0.0]
+    decision_latencies_ms: list[list[float]] = [[], []]
 
     try:
         while int_or(obs["current"], "result", -1) == -1 and steps < max_steps:
@@ -189,6 +190,7 @@ def play_single_match(
             dt_ms = (time.perf_counter() - ts) * 1000.0
             decision_counts[who] += 1
             decision_time_ms[who] += dt_ms
+            decision_latencies_ms[who].append(dt_ms)
 
             is_valid = (
                 isinstance(act, list)
@@ -224,6 +226,7 @@ def play_single_match(
         "invalid_actions": invalid_actions,
         "runtime_errors": runtime_errors,
         "decision_counts": decision_counts,
+        "decision_latencies_ms": decision_latencies_ms,
         "avg_latency_ms": [
             round(decision_time_ms[0] / max(decision_counts[0], 1), 4),
             round(decision_time_ms[1] / max(decision_counts[1], 1), 4),
@@ -231,27 +234,129 @@ def play_single_match(
     }
 
 
+def _summarize_latencies(latencies_ms: list[float]) -> dict[str, Any]:
+    if not latencies_ms:
+        return {"total_decisions": 0, "mean": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+    arr = np.asarray(latencies_ms, dtype=np.float64)
+    return {
+        "total_decisions": int(arr.size),
+        "mean": round(float(np.mean(arr)), 4),
+        "p50": round(float(np.percentile(arr, 50)), 4),
+        "p95": round(float(np.percentile(arr, 95)), 4),
+        "p99": round(float(np.percentile(arr, 99)), 4),
+        "max": round(float(np.max(arr)), 4),
+    }
+
+
+def evaluate_cross_deck_matrix(
+    model: Any,
+    deck_pool: list[tuple[str, list[int]]],
+    games_per_pair: int = 6,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Evaluate all `(model_deck, opp_deck)` pairs vs `heuristic_baseline`."""
+    matrix: dict[str, dict[str, Any]] = {}
+    all_latencies: list[float] = []
+    tot_games = tot_wins = tot_draws = tot_losses = tot_timeouts = 0
+    tot_inv = tot_err = 0
+
+    for mi, (m_name, m_dk) in enumerate(deck_pool):
+        matrix[m_name] = {}
+        for oi, (o_name, o_dk) in enumerate(deck_pool):
+            wins = draws = losses = timeouts = 0
+            m_inv = m_err = 0
+            pair_lats: list[float] = []
+
+            for g in range(games_per_pair):
+                opp_agent = make_heuristic_baseline_agent(
+                    seed=seed + 10000 + mi * 100 + oi * 20 + g,
+                    default_deck=o_dk,
+                )
+
+                def policy_agent(obs_dict: dict[str, Any], _dk: list[int] = m_dk) -> list[int]:
+                    return model.select_action(obs_dict, default_deck=_dk, device="cpu")
+
+                model_seat = g % 2
+                if model_seat == 0:
+                    res = play_single_match(policy_agent, opp_agent, m_dk, o_dk)
+                else:
+                    res = play_single_match(opp_agent, policy_agent, o_dk, m_dk)
+
+                w = res["winner"]
+                if w == model_seat:
+                    wins += 1
+                elif w == (1 - model_seat):
+                    losses += 1
+                elif w == 2:
+                    draws += 1
+                else:
+                    timeouts += 1
+
+                m_inv += res["invalid_actions"][model_seat]
+                m_err += res["runtime_errors"][model_seat]
+                pair_lats.extend(res["decision_latencies_ms"][model_seat])
+
+            all_latencies.extend(pair_lats)
+            tot_games += games_per_pair
+            tot_wins += wins
+            tot_draws += draws
+            tot_losses += losses
+            tot_timeouts += timeouts
+            tot_inv += m_inv
+            tot_err += m_err
+
+            matrix[m_name][o_name] = {
+                "games": games_per_pair,
+                "wins": wins,
+                "draws": draws,
+                "losses": losses,
+                "timeouts": timeouts,
+                "win_rate": round(wins / max(games_per_pair, 1), 4),
+                "is_mirror": (m_name == o_name),
+                "model_invalid_actions": m_inv,
+                "model_runtime_errors": m_err,
+            }
+
+    return {
+        "opponent": "heuristic_baseline",
+        "games_per_pair": games_per_pair,
+        "total_games": tot_games,
+        "wins": tot_wins,
+        "draws": tot_draws,
+        "losses": tot_losses,
+        "timeouts": tot_timeouts,
+        "overall_win_rate": round(tot_wins / max(tot_games, 1), 4),
+        "model_invalid_actions": tot_inv,
+        "model_runtime_errors": tot_err,
+        "cpu_latency_ms": _summarize_latencies(all_latencies),
+        "matrix": matrix,
+    }
+
+
 def evaluate_in_simulator(
     checkpoint_path: str | Path = "checkpoints/best_model.pt",
-    num_games_per_opponent: int = 40,
+    num_games_per_opponent: int = 42,
+    cross_deck_games_per_pair: int = 6,
     seed: int = 42,
     out_file: str | Path = "checkpoints/eval_results.json",
+    data_dir: str | Path = "data/processed",
 ) -> dict[str, Any]:
-    """Evaluate offline test accuracy and online simulator win-rate vs baselines on true mirror matches."""
+    """Evaluate offline test/val splits, mirror matches, cross-deck matrix, and CPU latency."""
     model, default_deck, ckpt = load_policy_from_checkpoint(checkpoint_path, device="cpu")
 
-    test_path = Path("data/processed/test.pt")
-    val_path = Path("data/processed/val.pt")
-    offline_test = (
-        evaluate_packed_split(model, torch.load(test_path, weights_only=False), torch.device("cpu"))
-        if test_path.exists()
-        else {}
-    )
-    offline_val = (
-        evaluate_packed_split(model, torch.load(val_path, weights_only=False), torch.device("cpu"))
-        if val_path.exists()
-        else {}
-    )
+    data_path = Path(data_dir)
+    offline_test: dict[str, Any] = {}
+    offline_val: dict[str, Any] = {}
+    try:
+        if get_split_shard_paths(data_path, "test"):
+            offline_test = evaluate_packed_split(model, data_path, torch.device("cpu"), split_name="test")
+    except FileNotFoundError:
+        pass
+    try:
+        if get_split_shard_paths(data_path, "val"):
+            offline_val = evaluate_packed_split(model, data_path, torch.device("cpu"), split_name="val")
+    except FileNotFoundError:
+        pass
 
     deck_pool: list[tuple[str, list[int]]] = [("default_deck", default_deck)]
     for dpath in [Path("decks/dragapult_deck.csv"), Path("decks/starmie_deck.csv")]:
@@ -266,6 +371,8 @@ def evaluate_in_simulator(
     }
 
     match_summaries: dict[str, Any] = {}
+    all_cpu_latencies_ms: list[float] = []
+
     for opp_name, opp_factory in opponents.items():
         wins = draws = losses = timeouts = 0
         p0_wdl = [0, 0, 0]
@@ -279,17 +386,16 @@ def evaluate_in_simulator(
         opp_invalid = 0
         total_turns = 0
         total_steps = 0
-        latencies: list[float] = []
+        opp_decision_lats: list[float] = []
 
         for g in range(num_games_per_opponent):
             deck_name, dk = deck_pool[(g // 2) % len(deck_pool)]
             opp_agent = opp_factory(seed + 1000 + g, dk)
 
-            # Fix BUG-1: policy_agent uses the exact mirror deck `dk` for this game
             def policy_agent(obs_dict: dict[str, Any], _dk: list[int] = dk) -> list[int]:
                 return model.select_action(obs_dict, default_deck=_dk, device="cpu")
 
-            model_seat = g % 2  # Alternate Seat 0 and Seat 1
+            model_seat = g % 2
             if model_seat == 0:
                 res = play_single_match(policy_agent, opp_agent, dk, dk)
             else:
@@ -321,8 +427,10 @@ def evaluate_in_simulator(
             opp_invalid += res["invalid_actions"][1 - model_seat]
             total_turns += res["turns"]
             total_steps += res["steps"]
-            latencies.append(res["avg_latency_ms"][model_seat])
+            opp_decision_lats.extend(res["decision_latencies_ms"][model_seat])
 
+        all_cpu_latencies_ms.extend(opp_decision_lats)
+        lat_stats = _summarize_latencies(opp_decision_lats)
         win_rate = wins / max(num_games_per_opponent, 1)
         score_rate = (wins + 0.5 * draws) / max(num_games_per_opponent, 1)
         match_summaries[opp_name] = {
@@ -341,8 +449,18 @@ def evaluate_in_simulator(
             "opponent_invalid_actions": opp_invalid,
             "avg_turns": round(total_turns / max(num_games_per_opponent, 1), 2),
             "avg_steps": round(total_steps / max(num_games_per_opponent, 1), 2),
-            "avg_decision_latency_ms": round(sum(latencies) / max(len(latencies), 1), 4),
+            "avg_decision_latency_ms": lat_stats["mean"],
+            "p99_decision_latency_ms": lat_stats["p99"],
         }
+
+    cross_deck_matrix = (
+        evaluate_cross_deck_matrix(model, deck_pool, games_per_pair=cross_deck_games_per_pair, seed=seed)
+        if cross_deck_games_per_pair > 0
+        else {}
+    )
+    if cross_deck_matrix:
+        # Combine raw decision latencies by running latency summary from mirror matches + cross deck
+        pass
 
     results = {
         "dataset_ref": DATASET_REF,
@@ -351,9 +469,12 @@ def evaluate_in_simulator(
         "seed": seed,
         "checkpoint_path": str(Path(checkpoint_path).resolve()),
         "checkpoint_epoch": ckpt.get("epoch"),
+        "checkpoint_rl_update": ckpt.get("rl_update"),
         "offline_val_metrics": offline_val,
         "offline_test_metrics": offline_test,
         "simulator_matches": match_summaries,
+        "cross_deck_matrix": cross_deck_matrix,
+        "cpu_latency_ms": _summarize_latencies(all_cpu_latencies_ms),
     }
 
     out_p = Path(out_file)

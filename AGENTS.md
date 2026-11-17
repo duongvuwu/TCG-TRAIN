@@ -6,9 +6,10 @@ Huấn luyện và đánh giá một agent chọn hành động hợp lệ trong
 
 ## Giao việc cho agent
 
-- **Worker coding** dùng **Gemini 4 Argon (Medium)** cho task triển khai hoặc sửa code. Với Antigravity CLI, đặt `--model gemini-4-argon-medium`.
-- **Reviewer bug** dùng **Gemini 4 Hydrogen (High)** cho task rà lỗi và hồi quy. Với Antigravity CLI, đặt `--model gemini-4-hydrogen-high`.
-- Khi tạo task mới cho một trong hai vai trò, chỉ định model và mức suy luận ngay lúc giao việc. Khi điều phối từ Codex, dùng Antigravity cho các task cần hai model Gemini này. Nếu model đã chọn không khả dụng, báo rõ model và vai trò bị ảnh hưởng.
+- **Worker coding (`@worker`)** dùng **Gemini 4 Hydrogen (High)** cho task triển khai hoặc sửa code. Với Antigravity CLI, đặt `--model gemini-4-hydrogen-high`.
+- **Reviewer bug (`@reviewer`)** dùng **Gemini 4 Hydrogen (High)** cho task rà lỗi và hồi quy. Với Antigravity CLI, đặt `--model gemini-4-hydrogen-high`.
+- **Swarm Monitor (`@monitor`)** dùng **Gemini 4 Argon (High)** cho task giám sát tiến độ và gỡ kẹt swarm. Với Antigravity CLI, đặt `--model gemini-4-argon-high`.
+- Khi tạo task mới cho các vai trò trên, chỉ định model và mức suy luận ngay lúc giao việc. Khi điều phối từ Codex, dùng Antigravity cho các task cần các model Gemini này. Nếu model đã chọn không khả dụng, báo rõ model và vai trò bị ảnh hưởng.
 
 ## Pipeline
 

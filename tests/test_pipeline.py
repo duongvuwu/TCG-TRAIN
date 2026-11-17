@@ -1,20 +1,21 @@
-"""Unit and integration tests for Pokémon TCG Battle Agent pipeline.
+"""Unit and integration tests for Pokémon TCG Battle Agent Phase 1-3 pipeline.
 
 Verifies:
 1. Pre-decision observation (`steps[t][seat]`) to chosen action (`steps[t+1][seat]`) alignment,
    plus separation of deck selection (`t=0`), waiting turns (`INACTIVE`), and terminal (`DONE`) steps.
 2. Zero future or opponent hidden-state leakage (`players[1-me]["hand"] is None`).
-3. Strict episode-level train/val/test split with zero episode overlap.
-4. Candidate scoring output format (`list[int]`, bounds `0 <= idx < len(option)`,
-   count in `[minCount, maxCount]`, unique sorted indices for multi-select, and empty `[]` when `minCount == 0`).
-5. Regression tests for BUG-1 through BUG-7 (mirror-match deck preservation, falsy-zero `maxCount == 0`
-   & `SelectType.MAIN == 0` anti-loop guard, high card/attack IDs `1331..1748`, `minCount == 0` empty-choice
-   loss gradient, monotonic LR on `--resume`, and `AreaType.STADIUM (7)` encoding).
+3. Sharded tensor storage & strict episode-level train/val/test split with zero episode overlap.
+4. Static fallback metadata (`cardId >= 1268`, `attackId >= 1557`) and replay metadata inference.
+5. Value head, conditional multi-select decoding, and Phase 2 checkpoint backward compatibility.
+6. PPO + KL-to-BC RL fine-tuning step & resume in CABT simulator.
+7. Cross-deck matchup matrix, CPU latency (`mean`, `p99`), and `agent.py` Kaggle entrypoint.
+8. Regression tests for BUG-1 through BUG-6.
 """
 from __future__ import annotations
 
 import copy
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -22,18 +23,37 @@ import pytest
 import torch
 
 from agent import agent as simulator_agent, load_agent_checkpoint
-from src.dataset import parse_single_replay
-from src.evaluate import make_random_baseline_agent, play_single_match
+from src.dataset import (
+    get_split_num_samples,
+    get_split_shard_paths,
+    iter_split_shards,
+    parse_single_replay,
+    preprocess_replays,
+    select_manifest_indices,
+)
+from src.evaluate import evaluate_cross_deck_matrix, make_random_baseline_agent, play_single_match
 from src.features import (
+    LEGACY_OPT_DIM,
+    LEGACY_STATE_DIM,
     MAX_ATTACK_ID,
     MAX_CARD_ID,
+    OPT_DIM,
+    STATE_DIM,
     _clamp_attack_id,
     _clamp_card_id,
     extract_decision_features,
+    get_attack_db,
+    get_card_db,
+    infer_fallback_metadata_from_replays,
     validate_no_leakage,
 )
 from src.model import PTCGPolicyNet
-from src.train import compute_policy_loss, load_default_deck, load_policy_from_checkpoint
+from src.train import (
+    compute_policy_loss,
+    load_default_deck,
+    load_policy_from_checkpoint,
+    train_rl_policy,
+)
 
 
 def _get_sample_replay_path() -> Path:
@@ -102,7 +122,7 @@ def test_no_opponent_or_future_leakage() -> None:
 
 
 def test_episode_level_split_disjointness() -> None:
-    """Verify that train, val, and test splits have strictly disjoint episode_ids."""
+    """Verify that train, val, and test shards have strictly disjoint episode_ids."""
     stats_path = Path("data/processed/dataset_stats.json")
     assert stats_path.exists(), "Run preprocess first to create dataset_stats.json"
     with open(stats_path, encoding="utf-8") as f:
@@ -119,9 +139,70 @@ def test_episode_level_split_disjointness() -> None:
     assert val_eps.isdisjoint(test_eps)
 
     for sname, expected_set in [("train", train_eps), ("val", val_eps), ("test", test_eps)]:
-        pt = torch.load(Path("data/processed") / f"{sname}.pt", weights_only=False)
-        actual_eps = set(pt["episode_ids"])
-        assert actual_eps.issubset(expected_set)
+        shard_paths = get_split_shard_paths("data/processed", sname)
+        assert len(shard_paths) >= 1
+        seen_eps: set[str] = set()
+        for sp in shard_paths:
+            pt = torch.load(sp, weights_only=False)
+            ep_set = set(pt["episode_ids"])
+            assert ep_set.issubset(expected_set)
+            seen_eps.update(ep_set)
+        assert len(seen_eps) > 0
+
+
+def test_sharded_preprocess_and_streaming_loader(tmp_path: Path) -> None:
+    """Verify bounded sharded preprocessing, multi-shard creation, and streaming iteration."""
+    replays = sorted([p for p in Path("data/replays").glob("*.json") if p.stem.isdigit()])[:5]
+    assert len(replays) >= 4
+    rdir = tmp_path / "replays"
+    pdir = tmp_path / "processed"
+    rdir.mkdir()
+    for rp in replays:
+        shutil.copy2(rp, rdir / rp.name)
+
+    summary = preprocess_replays(
+        replay_dir=rdir,
+        out_dir=pdir,
+        seed=42,
+        shard_size_samples=80,
+        infer_metadata=False,
+    )
+    assert summary["shard_summaries"]["train"]["num_shards"] >= 2
+    train_shards = get_split_shard_paths(pdir, "train")
+    assert len(train_shards) >= 2
+    assert all("train_shard_" in p.name for p in train_shards)
+
+    streamed_total = 0
+    streamed_eps: set[str] = set()
+    for _, shard in iter_split_shards(pdir, "train", shuffle=True, rng=np.random.default_rng(7)):
+        streamed_total += int(shard["num_samples"])
+        streamed_eps.update(shard["episode_ids"])
+        assert shard["state_vec"].shape[1] == STATE_DIM
+        assert shard["opt_feats"].shape[1] == OPT_DIM
+
+    assert streamed_total == get_split_num_samples(pdir, "train")
+    val_eps = set(summary["episode_splits"]["val"])
+    test_eps = set(summary["episode_splits"]["test"])
+    assert streamed_eps.isdisjoint(val_eps)
+    assert streamed_eps.isdisjoint(test_eps)
+
+    # Also verify manifest index selector diversification
+    idx = select_manifest_indices(1644, num_top=10, num_strided=10, max_episodes=15)
+    assert len(idx) == 15 and idx[:10] == list(range(10)) and idx[-1] <= 1643
+
+
+def test_fallback_metadata_table_and_inference() -> None:
+    """Verify static fallback metadata and replay inference for post-1267 cards & post-1556 attacks."""
+    cdb = get_card_db()
+    adb = get_attack_db()
+    for cid in (1331, 1387, 1406, 1413):
+        assert cid in cdb, f"Expected fallback metadata for cardId={cid}"
+    for aid in (1641, 1642, 1715, 1716, 1747, 1748):
+        assert aid in adb, f"Expected fallback metadata for attackId={aid}"
+    assert adb[1748].damage == 200
+
+    inf_c, inf_a = infer_fallback_metadata_from_replays("data/replays", max_files=10)
+    assert isinstance(inf_c, dict) and isinstance(inf_a, dict)
 
 
 def test_action_decoding_single_and_multiselect() -> None:
@@ -135,13 +216,121 @@ def test_action_decoding_single_and_multiselect() -> None:
     assert PTCGPolicyNet.decode_action_from_logits(logits, stop_logit=-5.0, min_count=0, max_count=0) == []
 
 
+def test_value_head_and_phase2_checkpoint_compat(tmp_path: Path) -> None:
+    """Verify value_head output and strict backward compatibility with Phase 2 checkpoints."""
+    sample_obs, _ = _get_sample_active_obs()
+    feats = extract_decision_features(sample_obs)
+
+    # 1. Phase 3 model forward_packed_with_value
+    m3 = PTCGPolicyNet()
+    m3.eval()
+    opt_l, stop_l, vals, state_h, opt_ctx = m3.forward_packed_with_value(
+        torch.from_numpy(feats["state_vec"]).unsqueeze(0),
+        torch.from_numpy(feats["hand_cards"]).unsqueeze(0),
+        torch.from_numpy(feats["board_cards"]).unsqueeze(0),
+        torch.tensor([feats["select_ctx"]], dtype=torch.long),
+        torch.tensor([feats["select_type"]], dtype=torch.long),
+        torch.tensor([feats["num_options"]], dtype=torch.long),
+        torch.from_numpy(feats["opt_feats"]),
+        torch.from_numpy(feats["opt_card_ids"]),
+        torch.from_numpy(feats["opt_target_card_ids"]),
+        torch.from_numpy(feats["opt_attack_ids"]),
+    )
+    assert opt_l.shape == (feats["num_options"],)
+    assert stop_l.shape == (1,)
+    assert vals.shape == (1,) and torch.isfinite(vals).all()
+    assert state_h.shape == (1, m3.hidden_dim)
+    assert opt_ctx.shape == (feats["num_options"], m3.hidden_dim)
+
+    # 2. Legacy Phase 2 checkpoint (64/48 dims, no set_attn/cond_multi, no value_head keys)
+    m2 = PTCGPolicyNet(
+        state_dim=LEGACY_STATE_DIM,
+        opt_dim=LEGACY_OPT_DIM,
+        hidden_dim=128,
+        use_set_attn=False,
+        use_cond_multi=False,
+    )
+    legacy_sd = {k: v for k, v in m2.state_dict().items() if not k.startswith("value_head.")}
+    legacy_ckpt = tmp_path / "phase2_legacy.pt"
+    torch.save(
+        {
+            "epoch": 21,
+            "model_state_dict": legacy_sd,
+            "config": {"hidden_dim": 128, "dropout": 0.1},
+            "default_deck": load_default_deck("deck.csv"),
+        },
+        legacy_ckpt,
+    )
+
+    loaded, dk, _ = load_policy_from_checkpoint(legacy_ckpt, device="cpu")
+    assert loaded.state_dim == LEGACY_STATE_DIM
+    assert loaded.opt_dim == LEGACY_OPT_DIM
+    assert loaded.use_set_attn is False
+    assert loaded.use_cond_multi is False
+    act = loaded.select_action(sample_obs, default_deck=dk, device="cpu")
+    assert isinstance(act, list)
+
+
+def test_rl_finetune_step_and_resume(tmp_path: Path) -> None:
+    """Verify PPO + KL-to-BC RL fine-tune update and `--resume` in CABT simulator."""
+    ckpt_path = Path("checkpoints/best_model.pt")
+    assert ckpt_path.exists()
+    rl_dir = tmp_path / "rl_ckpts"
+    s1 = train_rl_policy(
+        bc_checkpoint=ckpt_path,
+        checkpoint_dir=rl_dir,
+        updates=1,
+        episodes_per_update=2,
+        ppo_epochs=1,
+        mini_batch_size=32,
+        eval_games=2,
+        seed=42,
+        device_str="cpu",
+        promote_to_best=False,
+    )
+    assert Path(s1["last_rl_checkpoint"]).exists()
+    assert len(s1["history"]) == 1
+
+    s2 = train_rl_policy(
+        bc_checkpoint=ckpt_path,
+        checkpoint_dir=rl_dir,
+        updates=2,
+        episodes_per_update=2,
+        ppo_epochs=1,
+        mini_batch_size=32,
+        eval_games=2,
+        seed=42,
+        device_str="cpu",
+        resume_path=s1["last_rl_checkpoint"],
+        promote_to_best=False,
+    )
+    assert len(s2["history"]) == 2
+    assert s2["history"][-1]["rl_update"] == 2
+    assert s2["history"][-1]["eval_invalid_actions"] == 0
+
+
+def test_cross_deck_evaluation_and_latency() -> None:
+    """Verify cross-deck matchup matrix and CPU inference latency metrics."""
+    model, default_deck, _ = load_policy_from_checkpoint("checkpoints/best_model.pt", device="cpu")
+    starmie_deck = load_default_deck("decks/starmie_deck.csv")
+    pool = [("default_deck", default_deck), ("starmie_deck", starmie_deck)]
+
+    res = evaluate_cross_deck_matrix(model, pool, games_per_pair=1, seed=42)
+    assert res["total_games"] == 4
+    assert res["model_invalid_actions"] == 0
+    assert res["model_runtime_errors"] == 0
+    assert res["timeouts"] == 0
+    assert res["cpu_latency_ms"]["total_decisions"] > 0
+    assert res["cpu_latency_ms"]["p99"] >= res["cpu_latency_ms"]["mean"] > 0.0
+    assert res["matrix"]["default_deck"]["starmie_deck"]["is_mirror"] is False
+
+
 def test_bug1_mirror_match_deck_preservation() -> None:
     """Verify BUG-1 fix: play_single_match never overwrites explicit mirror decks."""
     starmie_deck = load_default_deck("decks/starmie_deck.csv")
     default_deck = load_default_deck("deck.csv")
     assert starmie_deck != default_deck
 
-    # Even if agent0 returns default_deck on init_obs, explicit deck0=starmie_deck must be used
     a0 = make_random_baseline_agent(seed=1, default_deck=default_deck)
     a1 = make_random_baseline_agent(seed=2, default_deck=starmie_deck)
     res = play_single_match(a0, a1, starmie_deck, starmie_deck, max_steps=100)
@@ -155,7 +344,6 @@ def test_bug2_falsy_zero_maxcount_zero_and_antiloop_guard() -> None:
     load_agent_checkpoint("checkpoints/best_model.pt")
     model, deck, _ = load_policy_from_checkpoint("checkpoints/best_model.pt", device="cpu")
 
-    # 1. maxCount == 0 with non-empty options must return []
     obs_zero = copy.deepcopy(sample_obs)
     obs_zero["select"]["minCount"] = 0
     obs_zero["select"]["maxCount"] = 0
@@ -163,18 +351,17 @@ def test_bug2_falsy_zero_maxcount_zero_and_antiloop_guard() -> None:
     assert simulator_agent(obs_zero) == []
     assert model.select_action(obs_zero, default_deck=deck) == []
 
-    # 2. Anti-loop guard when turnActionCount >= 20 and select.type == 0 (SelectType.MAIN)
     obs_loop = copy.deepcopy(sample_obs)
     obs_loop["current"]["turn"] = 5
     obs_loop["current"]["turnActionCount"] = 25
-    obs_loop["select"]["type"] = 0  # SelectType.MAIN (0 is falsy!)
+    obs_loop["select"]["type"] = 0
     obs_loop["select"]["context"] = 0
     obs_loop["select"]["minCount"] = 1
     obs_loop["select"]["maxCount"] = 1
     obs_loop["select"]["option"] = [
-        {"type": 10, "area": 5, "index": 0},  # ABILITY (index 0)
-        {"type": 10, "area": 5, "index": 1},  # ABILITY (index 1)
-        {"type": 14},                         # END (index 2)
+        {"type": 10, "area": 5, "index": 0},
+        {"type": 10, "area": 5, "index": 1},
+        {"type": 14},
     ]
     chosen = model.select_action(obs_loop, default_deck=deck)
     assert chosen == [2], f"Expected anti-loop guard to pick END [2], got {chosen}"
@@ -201,17 +388,15 @@ def test_bug4_and_bug5_zero_select_loss_and_resume_lr_monotonic() -> None:
     opt_logits = torch.tensor([0.5, 1.0, -0.2], requires_grad=True)
     stop_logits = torch.tensor([0.0], requires_grad=True)
     num_options = torch.tensor([3], dtype=torch.long)
-    chosen_mask = torch.tensor([0.0, 0.0, 0.0])  # Player chose [] when minCount == 0
+    chosen_mask = torch.tensor([0.0, 0.0, 0.0])
     min_count = torch.tensor([0], dtype=torch.long)
     max_count = torch.tensor([2], dtype=torch.long)
 
     loss = compute_policy_loss(opt_logits, stop_logits, num_options, chosen_mask, min_count, max_count)
     loss.backward()
-    # Gradient wrt stop_logits must be negative (so gradient descent increases stop_logits above opt_logits)
     assert stop_logits.grad is not None and float(stop_logits.grad.item()) < 0.0
     assert opt_logits.grad is not None and all(float(g) > 0.0 for g in opt_logits.grad)
 
-    # Check train_summary.json learning rate curve is non-increasing across resume epochs
     summary_path = Path("checkpoints/train_summary.json")
     if summary_path.exists():
         with open(summary_path, encoding="utf-8") as f:
@@ -228,12 +413,12 @@ def test_bug6_stadium_area_and_card_type_encoding() -> None:
     obs_stad["current"]["stadium"] = [{"id": 1256, "serial": 77, "playerIndex": 0}]
     obs_stad["select"]["option"] = [{"type": 10, "area": 7, "index": 0}]
     feats = extract_decision_features(obs_stad)
-    assert feats["opt_feats"][0, 23] == 1.0, "AreaType.STADIUM (7) must set slot 23"
+    assert feats["opt_feats"][0, 23] == 1.0
     assert feats["opt_card_ids"][0] == 1256
 
 
-def test_checkpoint_load_and_full_simulator_match() -> None:
-    """Verify loading `checkpoints/best_model.pt` and playing a complete CABT game with 0 invalid moves."""
+def test_checkpoint_load_and_agent_entrypoint_full_match() -> None:
+    """Verify loading `checkpoints/best_model.pt`, Kaggle wrapper compatibility, and full CABT game."""
     ckpt_path = Path("checkpoints/best_model.pt")
     assert ckpt_path.exists(), "Expected trained checkpoint at checkpoints/best_model.pt"
 
@@ -246,6 +431,11 @@ def test_checkpoint_load_and_full_simulator_match() -> None:
     load_agent_checkpoint(ckpt_path)
     init_act = simulator_agent({"select": None, "current": None, "logs": []})
     assert isinstance(init_act, list) and len(init_act) == 60
+
+    # Verify wrapped Kaggle observation payload compatibility
+    sample_obs, _ = _get_sample_active_obs()
+    wrapped_act = simulator_agent({"observation": sample_obs})
+    assert isinstance(wrapped_act, list)
 
     opp = make_random_baseline_agent(seed=123, default_deck=deck)
     res = play_single_match(simulator_agent, opp, deck, deck)

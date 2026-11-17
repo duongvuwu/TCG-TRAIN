@@ -20,12 +20,76 @@ import numpy as np
 import torch
 
 from src import DATASET_REF, DATASET_VERSION
-from src.features import extract_decision_features, int_or, validate_no_leakage
+from src.features import (
+    extract_decision_features,
+    infer_fallback_metadata_from_replays,
+    int_or,
+    register_fallback_metadata,
+    validate_no_leakage,
+)
+
+
+def select_manifest_indices(
+    num_rows: int,
+    num_top: int | None = None,
+    num_strided: int | None = None,
+    max_episodes: int | None = None,
+    diverse_indices: list[int] | None = None,
+) -> list[int]:
+    """Select ordered, deduplicated row indices from manifest.csv for diverse deck coverage."""
+    if num_rows <= 0:
+        return []
+
+    if max_episodes is not None and num_top is None and num_strided is None and diverse_indices is None:
+        cap = min(max(0, max_episodes), num_rows)
+        if cap >= num_rows:
+            return list(range(num_rows))
+        if cap == 0:
+            return []
+        top_k = cap // 2
+        stride_k = cap - top_k
+        indices = list(range(top_k))
+        if stride_k > 0 and top_k < num_rows:
+            grid = np.linspace(top_k, num_rows - 1, num=stride_k, dtype=int).tolist()
+            seen = set(indices)
+            for idx in grid:
+                if idx not in seen:
+                    indices.append(idx)
+                    seen.add(idx)
+        return indices[:cap]
+
+    eff_top = 30 if num_top is None else max(0, min(num_top, num_rows))
+    indices = list(range(eff_top))
+    seen = set(indices)
+
+    if diverse_indices is not None:
+        for idx in diverse_indices:
+            if 0 <= idx < num_rows and idx not in seen:
+                indices.append(idx)
+                seen.add(idx)
+
+    if num_strided is not None and num_strided > 0 and eff_top < num_rows:
+        grid = np.linspace(eff_top, num_rows - 1, num=min(num_strided, num_rows - eff_top), dtype=int).tolist()
+        for idx in grid:
+            if 0 <= idx < num_rows and idx not in seen:
+                indices.append(idx)
+                seen.add(idx)
+    elif num_strided is None and diverse_indices is None:
+        for idx in (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000):
+            if 0 <= idx < num_rows and idx not in seen:
+                indices.append(idx)
+                seen.add(idx)
+
+    if max_episodes is not None and max_episodes >= 0:
+        indices = indices[:max_episodes]
+    return indices
 
 
 def download_replays_from_kaggle(
     out_dir: str | Path = "data/replays",
-    num_top: int = 30,
+    num_top: int | None = None,
+    num_strided: int | None = None,
+    max_episodes: int | None = None,
     diverse_indices: list[int] | None = None,
 ) -> Path:
     """Download manifest.csv and selected replay JSONs from Kaggle dataset."""
@@ -45,19 +109,28 @@ def download_replays_from_kaggle(
     with open(manifest_file, encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
-    indices = list(range(min(num_top, len(rows))))
-    if diverse_indices is None:
-        diverse_indices = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
-    for idx in diverse_indices:
-        if 0 <= idx < len(rows) and idx not in indices:
-            indices.append(idx)
+    indices = select_manifest_indices(
+        num_rows=len(rows),
+        num_top=num_top,
+        num_strided=num_strided,
+        max_episodes=max_episodes,
+        diverse_indices=diverse_indices,
+    )
 
-    for idx in indices:
+    downloaded = 0
+    skipped_existing = 0
+    for pos, idx in enumerate(indices, start=1):
         ep_id = rows[idx]["episode_id"]
         target = out_path / f"{ep_id}.json"
-        if not target.exists():
-            p = kagglehub.dataset_download(DATASET_REF, path=f"{ep_id}.json")
-            shutil.move(p, target)
+        if target.exists() and target.stat().st_size > 0:
+            skipped_existing += 1
+            continue
+        p = kagglehub.dataset_download(DATASET_REF, path=f"{ep_id}.json")
+        shutil.move(p, target)
+        downloaded += 1
+        if downloaded % 20 == 0 or pos == len(indices):
+            print(f"[download-data] {pos}/{len(indices)} ready (downloaded={downloaded}, cached={skipped_existing})")
+
     return out_path
 
 
@@ -245,6 +318,99 @@ def pack_samples_to_tensors(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _save_shard(
+    samples: list[dict[str, Any]],
+    out_path: Path,
+    split_name: str,
+    shard_idx: int,
+) -> dict[str, Any]:
+    """Pack a bounded sample buffer into a shard file and return its manifest entry."""
+    packed = pack_samples_to_tensors(samples)
+    fname = f"{split_name}_shard_{shard_idx:04d}.pt"
+    fpath = out_path / fname
+    torch.save(packed, fpath)
+    ep_ids = sorted(set(packed["episode_ids"]))
+    n_samples = int(packed["num_samples"])
+    del packed
+    gc.collect()
+    return {
+        "file": fname,
+        "num_samples": n_samples,
+        "num_episodes": len(ep_ids),
+        "episode_ids": ep_ids,
+    }
+
+
+def load_split_shard_manifest(data_dir: str | Path, split_name: str) -> dict[str, Any]:
+    """Load the shard manifest JSON for `split_name` (`train`/`val`/`test`)."""
+    data_path = Path(data_dir)
+    manifest_p = data_path / f"{split_name}_shards.json"
+    if manifest_p.exists():
+        with open(manifest_p, encoding="utf-8") as f:
+            return json.load(f)
+
+    shard_files = sorted(data_path.glob(f"{split_name}_shard_*.pt"))
+    if shard_files:
+        return {
+            "split": split_name,
+            "num_shards": len(shard_files),
+            "num_samples": None,
+            "shards": [{"file": p.name} for p in shard_files],
+        }
+
+    legacy_p = data_path / f"{split_name}.pt"
+    if legacy_p.exists():
+        return {
+            "split": split_name,
+            "num_shards": 1,
+            "num_samples": None,
+            "shards": [{"file": legacy_p.name}],
+        }
+    raise FileNotFoundError(f"No shards or legacy .pt found for split '{split_name}' in {data_path}")
+
+
+def get_split_shard_paths(data_dir: str | Path, split_name: str) -> list[Path]:
+    """Return ordered list of shard file paths for `split_name`."""
+    data_path = Path(data_dir)
+    manifest = load_split_shard_manifest(data_path, split_name)
+    return [data_path / entry["file"] for entry in manifest["shards"]]
+
+
+def get_split_num_samples(data_dir: str | Path, split_name: str) -> int:
+    """Return total decision samples in `split_name` without keeping all shards in RAM."""
+    data_path = Path(data_dir)
+    manifest = load_split_shard_manifest(data_path, split_name)
+    if manifest.get("num_samples") is not None:
+        return int(manifest["num_samples"])
+    total = 0
+    for p in get_split_shard_paths(data_path, split_name):
+        pt = torch.load(p, weights_only=False)
+        total += int(pt["num_samples"])
+        del pt
+    return total
+
+
+def iter_split_shards(
+    data_dir: str | Path,
+    split_name: str,
+    shuffle: bool = False,
+    rng: np.random.Generator | None = None,
+):
+    """Stream-load one shard at a time so Peak CPU RAM remains O(1 shard)."""
+    paths = get_split_shard_paths(data_dir, split_name)
+    order = list(range(len(paths)))
+    if shuffle:
+        if rng is None:
+            rng = np.random.default_rng()
+        order = rng.permutation(len(paths)).tolist()
+    for idx in order:
+        p = paths[idx]
+        shard = torch.load(p, weights_only=False)
+        yield p, shard
+        del shard
+        gc.collect()
+
+
 def preprocess_replays(
     replay_dir: str | Path = "data/replays",
     out_dir: str | Path = "data/processed",
@@ -252,11 +418,50 @@ def preprocess_replays(
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
     drop_forced_in_train: bool = True,
+    shard_size_samples: int = 15000,
+    infer_metadata: bool = True,
 ) -> dict[str, Any]:
-    """Split replay files by episode_id first, stream-parse each episode, and save shards."""
+    """Split replay files by episode_id first, stream-parse each episode, and save bounded shards."""
     replay_path = Path(replay_dir)
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    # Remove stale shard files from previous runs
+    for old_f in list(out_path.glob("*_shard_*.pt")) + list(out_path.glob("*_shards.json")):
+        old_f.unlink()
+    for legacy_name in ("train.pt", "val.pt", "test.pt"):
+        lp = out_path / legacy_name
+        if lp.exists():
+            lp.unlink()
+
+    if infer_metadata:
+        inf_cards, inf_atks = infer_fallback_metadata_from_replays(replay_path)
+        register_fallback_metadata(inf_cards, inf_atks)
+        meta_dump = {
+            "cards": {
+                str(k): {
+                    "cardId": v.cardId,
+                    "cardType": v.cardType,
+                    "hp": v.hp,
+                    "ex": v.ex,
+                    "basic": v.basic,
+                    "stage": v.stage,
+                    "attacks": list(v.attacks),
+                    "skills": list(v.skills),
+                }
+                for k, v in inf_cards.items()
+            },
+            "attacks": {
+                str(k): {
+                    "attackId": v.attackId,
+                    "damage": v.damage,
+                    "energies": list(v.energies),
+                }
+                for k, v in inf_atks.items()
+            },
+        }
+        with open(out_path / "inferred_metadata.json", "w", encoding="utf-8") as f:
+            json.dump(meta_dump, f, indent=2)
 
     files = sorted(
         [p for p in replay_path.glob("*.json") if p.stem.isdigit()],
@@ -275,7 +480,6 @@ def preprocess_replays(
     if n_train + n_val >= n_total:
         n_train = max(1, n_total - 2)
         n_val = 1
-    n_test = n_total - n_train - n_val
 
     split_files = {
         "train": sorted(shuffled[:n_train], key=lambda p: int(p.stem)),
@@ -293,28 +497,69 @@ def preprocess_replays(
 
     overall_counts: Counter[str] = Counter()
     split_stats: dict[str, dict[str, int]] = {}
+    shard_summaries: dict[str, dict[str, Any]] = {}
     deck_counter: Counter[tuple[int, ...]] = Counter()
+    eff_shard_cap = max(1, int(shard_size_samples))
 
     for split_name, flist in split_files.items():
         s_counts: Counter[str] = Counter()
-        s_samples: list[dict[str, Any]] = []
+        shard_buf: list[dict[str, Any]] = []
+        shard_entries: list[dict[str, Any]] = []
+        shard_idx = 0
+        split_total_samples = 0
+        split_ep_ids: list[str] = []
         drop_forced = drop_forced_in_train and (split_name == "train")
 
-        for fp in flist:
+        for fp_idx, fp in enumerate(flist, start=1):
             ep_samples, ep_counts, ep_decks = parse_single_replay(fp, drop_forced_single=drop_forced)
-            s_samples.extend(ep_samples)
+            shard_buf.extend(ep_samples)
             s_counts.update(ep_counts)
             overall_counts.update(ep_counts)
+            split_ep_ids.append(fp.stem)
             if split_name == "train":
                 for dk in ep_decks:
                     deck_counter[tuple(dk)] += 1
+            del ep_samples
+
+            while len(shard_buf) >= eff_shard_cap:
+                chunk = shard_buf[:eff_shard_cap]
+                shard_buf = shard_buf[eff_shard_cap:]
+                entry = _save_shard(chunk, out_path, split_name, shard_idx)
+                shard_entries.append(entry)
+                split_total_samples += entry["num_samples"]
+                shard_idx += 1
+                del chunk
+                gc.collect()
+
+            if fp_idx % 25 == 0 or fp_idx == len(flist):
+                print(
+                    f"[preprocess:{split_name}] {fp_idx}/{len(flist)} episodes, "
+                    f"shards={len(shard_entries)}, buffered={len(shard_buf)}"
+                )
+
+        if shard_buf:
+            entry = _save_shard(shard_buf, out_path, split_name, shard_idx)
+            shard_entries.append(entry)
+            split_total_samples += entry["num_samples"]
+            shard_buf.clear()
             gc.collect()
 
-        packed = pack_samples_to_tensors(s_samples)
-        torch.save(packed, out_path / f"{split_name}.pt")
+        manifest = {
+            "split": split_name,
+            "num_shards": len(shard_entries),
+            "num_samples": split_total_samples,
+            "episode_ids": split_ep_ids,
+            "shards": shard_entries,
+        }
+        with open(out_path / f"{split_name}_shards.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        shard_summaries[split_name] = {
+            "num_shards": len(shard_entries),
+            "num_samples": split_total_samples,
+            "shard_files": [e["file"] for e in shard_entries],
+        }
         split_stats[split_name] = dict(sorted(s_counts.items()))
-        del s_samples, packed
-        gc.collect()
 
     top_deck = list(deck_counter.most_common(1)[0][0]) if deck_counter else []
 
@@ -322,10 +567,12 @@ def preprocess_replays(
         "dataset_ref": DATASET_REF,
         "dataset_version": DATASET_VERSION,
         "seed": seed,
+        "shard_size_samples": eff_shard_cap,
         "num_episodes_total": n_total,
         "episode_splits": {
             k: [p.stem for p in v] for k, v in split_files.items()
         },
+        "shard_summaries": shard_summaries,
         "overall_counts": dict(sorted(overall_counts.items())),
         "split_counts": split_stats,
         "exclusion_reasons": {
